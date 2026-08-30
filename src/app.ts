@@ -39,3 +39,4 @@ app.get("/api/products/best-sellers", async (req, res) => {
 });
 
 export default app;
+
