@@ -9,12 +9,96 @@ datasource db {
 
 model Product {
   id          Int      @id @default(autoincrement())
-  name        String
+  name        String   @unique
   price       Float
   description String
+  createdAt   DateTime @default(now())
   category    String
   imageUrl    String
   stock       Int      @default(10)
-  createdAt   DateTime @default(now())
+  isBestSeller Boolean  @default(false)
   updatedAt   DateTime @updatedAt
+  // flash sale fields — both optional, product is "on sale" only if discountPercent > 0 and saleEndsAt is in the future
+  discountPercent Int?
+  saleEndsAt      DateTime?
+}
+
+model account {
+  id                    String    @id
+  userId                String
+  accountId             String
+  providerId            String
+  accessToken           String?
+  refreshToken          String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  idToken               String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime
+  issuer                String?
+  user                  user      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model jwks {
+  id         String   @id
+  publicKey  String
+  privateKey String
+  createdAt  DateTime @default(now())
+  alg        String?
+  crv        String?
+}
+
+model seller_request {
+  id          String   @id
+  userId      String
+  storeName   String
+  phone       String?
+  description String?
+  status      String   @default("PENDING")
+  adminNote   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime
+  user        user     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model session {
+  id        String   @id
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime
+  user      user     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model user {
+  id             String           @id
+  name           String
+  email          String           @unique
+  emailVerified  Boolean          @default(false)
+  image          String?
+  role           String           @default("buyer")
+  status         String           @default("active")
+  phone          String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime
+  banExpires     DateTime?
+  banReason      String?
+  banned         Boolean          @default(false)
+  account        account[]
+  seller_request seller_request[]
+  session        session[]
+}
+
+model verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime
 }
