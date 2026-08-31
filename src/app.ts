@@ -14,6 +14,7 @@ app.get("/", (req, res) => {
 app.get("/api/products", async (req, res) => {
   try {
     const products = await prisma.product.findMany({
+      where: { isBestSeller: false },
       orderBy: { createdAt: "desc" },
     });
     res.json(products);
@@ -23,4 +24,19 @@ app.get("/api/products", async (req, res) => {
   }
 });
 
+// only returns products flagged as best sellers
+app.get("/api/products/best-sellers", async (req, res) => {
+  try {
+    const products = await prisma.product.findMany({
+      where: { isBestSeller: true },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(products);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Failed to fetch best sellers" });
+  }
+});
+
 export default app;
+
