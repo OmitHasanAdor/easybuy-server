@@ -18,6 +18,9 @@ model Product {
   stock       Int      @default(10)
   isBestSeller Boolean  @default(false)
   updatedAt   DateTime @updatedAt
+  // flash sale fields — both optional, product is "on sale" only if discountPercent > 0 and saleEndsAt is in the future
+  discountPercent Int?
+  saleEndsAt      DateTime?
 }
 
 model account {
@@ -99,9 +102,3 @@ model verification {
   createdAt  DateTime @default(now())
   updatedAt  DateTime
 }
-
-
-
-
-
-
