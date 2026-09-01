@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
 import { defineConfig } from "prisma/config";
-
+console.log("DIRECT_URL:", process.env["DIRECT_URL"]);
 export default defineConfig({
   schema: "prisma/schema.prisma",
   datasource: {
