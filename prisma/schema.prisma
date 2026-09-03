@@ -14,14 +14,89 @@ model Product {
   description     String
   createdAt       DateTime  @default(now())
   category        String
-  imageUrl        String
+  images          String[]  @default([])
   stock           Int       @default(10)
   isBestSeller    Boolean   @default(false)
   discountPercent Int?
   saleEndsAt      DateTime?
+  hasVariants     Boolean   @default(false)
   updatedAt       DateTime  @updatedAt
 
   orderItems OrderItem[]
+  variants   ProductVariant[]
+  wishlists  Wishlist[]
+  cartItems  CartItem[]
+  reviews    Review[]
+}
+
+// One row per size/color combination for a product that has variants.
+// Only relevant when Product.hasVariants is true.
+model ProductVariant {
+  id        Int      @id @default(autoincrement())
+  productId Int
+  size      String?
+  color     String?
+  stock     Int      @default(0)
+  price     Float? // optional override; falls back to Product.price when null
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product   Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  cartItems CartItem[]
+
+  // prevents the same size+color combo being created twice for one product
+  @@unique([productId, size, color])
+}
+
+// One row per user per saved product.
+model Wishlist {
+  id        Int      @id @default(autoincrement())
+  userId    String
+  productId Int
+  createdAt DateTime @default(now())
+
+  user    user    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // a user can only wishlist the same product once
+  @@unique([userId, productId])
+}
+
+// One row per user per (product + variant) in their cart.
+model CartItem {
+  id        Int      @id @default(autoincrement())
+  userId    String
+  productId Int
+  variantId Int? // null when the product has no size/color variants
+  quantity  Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    user            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  // a user can only have one cart row per exact product+variant combo
+  @@unique([userId, productId, variantId])
+}
+
+// One row per user per review left on a product.
+model Review {
+  id                Int      @id @default(autoincrement())
+  userId            String
+  productId         Int
+  rating            Int // 1 to 5
+  title             String?
+  comment           String?
+  verifiedPurchase  Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user    user    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // a user can only leave one review per product
+  @@unique([userId, productId])
 }
 
 model account {
@@ -94,6 +169,9 @@ model user {
   seller_request seller_request[]
   session        session[]
   orders         Order[]
+  wishlists      Wishlist[]
+  cartItems      CartItem[]
+  reviews        Review[]
 }
 
 model verification {
