@@ -3,6 +3,7 @@ import cors from "cors";
 import { z } from "zod";
 import prisma from "./prisma.ts";
 import { requireAuth } from "./middleware/requireAuth.ts";
+import sellerRoutes from "./routes/seller.ts";
 
 const app = express();
 
@@ -245,6 +246,36 @@ app.post("/api/wishlist", requireAuth, async (req, res) => {
   }
 });
 
+// get reviews written by the logged-in user
+app.get("/api/reviews/my", requireAuth, async (req, res) => {
+  try {
+    const reviews = await prisma.review.findMany({
+      where: {
+        userId: req.userId!,
+      },
+      include: {
+        product: {
+          select: {
+            id: true,
+            name: true,
+            images: true,
+          },
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    res.json(reviews);
+  } catch (error) {
+    console.error("Error fetching my reviews:", error);
+    res.status(500).json({
+      error: "Failed to fetch your reviews",
+    });
+  }
+});
+
 // remove a product from a user's wishlist
 app.delete("/api/wishlist/:productId", requireAuth, async (req, res) => {
   const productId = Number(req.params.productId);
@@ -452,5 +483,7 @@ app.delete("/api/products/:id/reviews", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to delete review" });
   }
 });
+
+app.use("/api/seller", sellerRoutes);
 
 export default app;

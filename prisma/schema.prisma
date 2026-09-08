@@ -22,11 +22,15 @@ model Product {
   hasVariants     Boolean   @default(false)
   updatedAt       DateTime  @updatedAt
 
-  orderItems OrderItem[]
-  variants   ProductVariant[]
-  wishlists  Wishlist[]
-  cartItems  CartItem[]
-  reviews    Review[]
+  // Seller ownership
+  sellerId        String?
+  seller          user?     @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+
+  orderItems      OrderItem[]
+  variants        ProductVariant[]
+  wishlists       Wishlist[]
+  cartItems       CartItem[]
+  reviews         Review[]
 }
 
 // One row per size/color combination for a product that has variants.
@@ -161,10 +165,11 @@ model user {
   status         String           @default("active")
   phone          String?
   createdAt      DateTime         @default(now())
-  updatedAt      DateTime
+  updatedAt      DateTime         @updatedAt
   banExpires     DateTime?
   banReason      String?
   banned         Boolean          @default(false)
+
   account        account[]
   seller_request seller_request[]
   session        session[]
@@ -172,6 +177,9 @@ model user {
   wishlists      Wishlist[]
   cartItems      CartItem[]
   reviews        Review[]
+
+  // Products owned by this seller
+  products       Product[]
 }
 
 model verification {
