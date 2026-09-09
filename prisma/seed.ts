@@ -1,6 +1,8 @@
 import prisma from "../src/prisma";
 
-// Trending Products 
+// ======================
+// PRODUCTS DATA
+// ======================
 const trendingProducts = [
   { name: "Classic Oxford Shirt", price: 1450, description: "A crisp, breathable oxford shirt built for everyday wear.", category: "Men's Fashion", images: ["https://images.unsplash.com/photo-1602810318383-e386cc2a3ccf?w=600"], stock: 25, isBestSeller: false },
   { name: "Linen Summer Dress", price: 2100, description: "Lightweight linen dress, perfect for warm days.", category: "Women's Fashion", images: ["https://images.unsplash.com/photo-1595777457583-95e059d581b8?w=600"], stock: 15, isBestSeller: false },
@@ -24,7 +26,6 @@ const trendingProducts = [
   { name: "Cotton Bucket Hat", price: 480, description: "Lightweight cotton hat for sunny days out.", category: "New Arrivals", images: ["https://images.unsplash.com/photo-1521369909029-2afed882baee?w=600"], stock: 19, isBestSeller: false },
 ];
 
-// Best Sellers
 const bestSellerProducts = [
   { name: "Merino Wool Sweater", price: 2650, description: "Premium merino wool crewneck, warm without the bulk.", category: "Men's Fashion", images: ["https://images.unsplash.com/photo-1614975059251-992f11792b9f?w=600"], stock: 20, isBestSeller: true },
   { name: "Structured Tote Bag", price: 2200, description: "Everyday tote with a sturdy structured shape and interior pockets.", category: "Women's Fashion", images: ["https://images.unsplash.com/photo-1590874103328-eac38a683ce7?w=600"], stock: 16, isBestSeller: true },
@@ -38,93 +39,150 @@ const bestSellerProducts = [
   { name: "Marble Coasters Set", price: 750, description: "Set of four polished marble coasters with cork backing.", category: "Home & Lifestyle", images: ["https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTkwHbCBq70jIgfTq-qddZzVE9QYVy7edVBwsqTiK7B8Q&s"], stock: 22, isBestSeller: true },
 ];
 
-// ---- Order seeding config  ----
-const TEST_USER_EMAIL = "eshams05@gmail.com";
+const BUYER_EMAIL = "eshams05@gmail.com";
+const SELLER_EMAIL = "shams05@gmail.com";
 
+// ======================
+// 1. PRODUCTS
+// ======================
 async function seedProducts() {
   const all = [...trendingProducts, ...bestSellerProducts];
-  console.log(`Seeding ${all.length} products (${trendingProducts.length} trending + ${bestSellerProducts.length} best sellers)...`);
+  console.log(`Seeding ${all.length} products...`);
 
   for (const product of all) {
     await prisma.product.upsert({
       where: { name: product.name },
-      update: { isBestSeller: product.isBestSeller, images: product.images },
+      update: {
+        isBestSeller: product.isBestSeller,
+        images: product.images,
+        price: product.price,
+        stock: product.stock,
+        description: product.description,
+        category: product.category,
+      },
       create: product,
     });
   }
-
-  console.log(`Done. ${bestSellerProducts.length} products marked as best sellers.`);
+  console.log("Products done.");
 }
 
-async function seedOrders() {
-  const user = await prisma.user.findUnique({
-    where: {
-      email: TEST_USER_EMAIL,
-    },
+// ======================
+// 2. SELLER SETUP
+// ======================
+async function seedSeller() {
+  const seller = await prisma.user.findUnique({
+    where: { email: SELLER_EMAIL },
   });
 
-  if (!user) {
+  if (!seller) {
     console.error(
-      `No user found with email ${TEST_USER_EMAIL}. Please create this account first. Skipping order seeding.`
+      `❌ No user found with email ${SELLER_EMAIL}.\n` +
+        `   Please register this account on the website first, then re-run seed.`
+    );
+    return null;
+  }
+
+  // Make them a seller
+  await prisma.user.update({
+    where: { id: seller.id },
+    data: { role: "seller", status: "active" },
+  });
+
+  // Approved seller_request (for store name)
+  const existingReq = await prisma.seller_request.findFirst({
+    where: { userId: seller.id },
+  });
+
+  if (existingReq) {
+    await prisma.seller_request.update({
+      where: { id: existingReq.id },
+      data: {
+        status: "APPROVED",
+        storeName: "Shams Store",
+        description: "Quality fashion and lifestyle products",
+        phone: seller.phone,
+      },
+    });
+  } else {
+    await prisma.seller_request.create({
+      data: {
+        id: crypto.randomUUID(),
+        userId: seller.id,
+        storeName: "Shams Store",
+        description: "Quality fashion and lifestyle products",
+        phone: seller.phone,
+        status: "APPROVED",
+        updatedAt: new Date(),
+      },
+    });
+  }
+
+  // Assign ALL products to this seller
+  const updated = await prisma.product.updateMany({
+    data: { sellerId: seller.id },
+  });
+
+  console.log(`✅ Seller ready: ${SELLER_EMAIL}`);
+  console.log(`   Assigned ${updated.count} products to seller.`);
+  return seller;
+}
+
+// ======================
+// 3. BUYER ORDERS
+// ======================
+async function seedOrders() {
+  const buyer = await prisma.user.findUnique({
+    where: { email: BUYER_EMAIL },
+  });
+
+  if (!buyer) {
+    console.error(
+      `No buyer found with email ${BUYER_EMAIL}. Skipping order seeding.`
     );
     return;
   }
 
-// Don't re-seed orders if this user already has some — avoids creating duplicates
-  const existingOrderCount = await prisma.order.count({ where: { userId: user.id } });
+  const existingOrderCount = await prisma.order.count({
+    where: { userId: buyer.id },
+  });
   if (existingOrderCount > 0) {
-    console.log(`${user.email} already has ${existingOrderCount} order(s). Skipping order seeding.`);
+    console.log(
+      `${buyer.email} already has ${existingOrderCount} order(s). Skipping order seeding.`
+    );
     return;
   }
 
-  const products = await prisma.product.findMany({
-    take: 5,
-  });
-
+  const products = await prisma.product.findMany({ take: 5 });
   if (products.length === 0) {
-    console.error("No products found. Please add some products first. Skipping order seeding.");
+    console.error("No products found. Skipping order seeding.");
     return;
   }
 
   const sampleOrders = [
     {
       status: "DELIVERED",
-      items: [
-        {
-          product: products[0],
-          quantity: 1,
-        },
-      ],
+      items: [{ product: products[0], quantity: 1 }],
     },
     {
       status: "SHIPPED",
       items: [
-        {
-          product: products[1] ?? products[0],
-          quantity: 2,
-        },
-        {
-          product: products[2] ?? products[0],
-          quantity: 1,
-        },
+        { product: products[1] ?? products[0], quantity: 2 },
+        { product: products[2] ?? products[0], quantity: 1 },
       ],
     },
     {
       status: "PENDING",
-      items: [
-        {
-          product: products[3] ?? products[0],
-          quantity: 1,
-        },
-      ],
+      items: [{ product: products[3] ?? products[0], quantity: 1 }],
     },
     {
       status: "CANCELLED",
+      items: [{ product: products[4] ?? products[0], quantity: 1 }],
+    },
+    {
+      status: "DELIVERED",
       items: [
-        {
-          product: products[4] ?? products[0],
-          quantity: 1,
-        },
+        { product: products[0], quantity: 2 },
+        { product: products[1] ?? products[0], quantity: 1 },
       ],
     },
   ];
@@ -136,7 +194,7 @@ async function seedOrders() {
     );
     await prisma.order.create({
       data: {
-        userId: user.id,
+        userId: buyer.id,
         status: order.status,
         total,
         items: {
@@ -150,60 +208,72 @@ async function seedOrders() {
     });
   }
 
-  console.log(`Seeded ${sampleOrders.length} orders for ${user.email}`);
+  console.log(`✅ Seeded ${sampleOrders.length} orders for ${buyer.email}`);
 }
 
+// ======================
+// 4. REVIEWS (buyer on seller products)
+// ======================
 async function seedReviews() {
-  const user = await prisma.user.findUnique({
-    where: { email: TEST_USER_EMAIL },
+  const buyer = await prisma.user.findUnique({
+    where: { email: BUYER_EMAIL },
   });
 
-  if (!user) {
-    console.error(
-      `No user found with email ${TEST_USER_EMAIL}. Skipping review seeding.`
-    );
+  if (!buyer) {
+    console.error(`No buyer found with ${BUYER_EMAIL}. Skipping reviews.`);
     return;
   }
 
-// Don't re-seed reviews if this user already has some — avoids creating
   const sampleReviews = [
-    { productName: "Classic Oxford Shirt", rating: 5, title: "Great everyday shirt", comment: "Fits true to size and the fabric feels much better than the price suggests. Wearing it weekly now." },
+    { productName: "Classic Oxford Shirt", rating: 5, title: "Great everyday shirt", comment: "Fits true to size and the fabric feels much better than the price suggests." },
     { productName: "Merino Wool Sweater", rating: 4, title: "Warm but runs slightly large", comment: "Quality is excellent, very soft. I'd size down if you're between sizes." },
-    { productName: "Leather Weekend Bag", rating: 5, title: "Sturdy and looks premium", comment: "Used it for two trips already, straps are holding up well and the leather is thick." },
-    { productName: "Aviator Sunglasses", rating: 3, title: "Decent, but arm hinges are loose", comment: "Look and tint are good, but the hinge on one arm was slightly loose out of the box." },
-    { productName: "Wooden Coffee Table", rating: 5, title: "Beautiful finish", comment: "Solid wood, no wobble, assembly was straightforward. Looks great in the living room." },
-    { productName: "Chrono Steel Watch", rating: 4, title: "Good value chronograph", comment: "Face is a bit busy but the build quality feels solid for this price range." },
+    { productName: "Leather Weekend Bag", rating: 5, title: "Sturdy and looks premium", comment: "Used it for two trips already, straps are holding up well." },
+    { productName: "Aviator Sunglasses", rating: 3, title: "Decent, but arm hinges are loose", comment: "Look and tint are good, but one hinge was slightly loose." },
+    { productName: "Wooden Coffee Table", rating: 5, title: "Beautiful finish", comment: "Solid wood, no wobble. Looks great in the living room." },
+    { productName: "Chrono Steel Watch", rating: 4, title: "Good value chronograph", comment: "Build quality feels solid for this price range." },
   ];
 
-  console.log(`Seeding ${sampleReviews.length} sample reviews for ${user.email}...`);
+  console.log(`Seeding ${sampleReviews.length} reviews...`);
 
   for (const r of sampleReviews) {
-    const product = await prisma.product.findUnique({ where: { name: r.productName } });
+    const product = await prisma.product.findUnique({
+      where: { name: r.productName },
+    });
     if (!product) {
-      console.warn(`Product "${r.productName}" not found, skipping its review.`);
+      console.warn(`Product "${r.productName}" not found, skipping.`);
       continue;
     }
     await prisma.review.upsert({
-      where: { userId_productId: { userId: user.id, productId: product.id } },
-      update: { rating: r.rating, title: r.title, comment: r.comment },
+      where: {
+        userId_productId: { userId: buyer.id, productId: product.id },
+      },
+      update: {
+        rating: r.rating,
+        title: r.title,
+        comment: r.comment,
+      },
       create: {
-        userId: user.id,
+        userId: buyer.id,
         productId: product.id,
         rating: r.rating,
         title: r.title,
         comment: r.comment,
-        verifiedPurchase: false,
+        verifiedPurchase: true,
       },
     });
   }
 
-  console.log(`Done seeding reviews.`);
+  console.log("✅ Reviews done.");
 }
 
+// ======================
+// MAIN
+// ======================
 async function main() {
   await seedProducts();
-  await seedOrders();
-  await seedReviews();
+  await seedSeller(); // seller role + assign products
+  await seedOrders(); // buyer orders (shows on seller Orders/Analytics/Earnings)
+  await seedReviews(); // reviews on seller products
 }
 
 main()

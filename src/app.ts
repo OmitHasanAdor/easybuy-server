@@ -3,6 +3,8 @@ import cors from "cors";
 import { z } from "zod";
 import prisma from "./prisma.ts";
 import { requireAuth } from "./middleware/requireAuth.ts";
+import sellerRoutes from "./routes/seller.ts";
+import adminRoutes from "./routes/admin.ts";
 
 const app = express();
 
@@ -245,6 +247,36 @@ app.post("/api/wishlist", requireAuth, async (req, res) => {
   }
 });
 
+// get reviews written by the logged-in user
+app.get("/api/reviews/my", requireAuth, async (req, res) => {
+  try {
+    const reviews = await prisma.review.findMany({
+      where: {
+        userId: req.userId!,
+      },
+      include: {
+        product: {
+          select: {
+            id: true,
+            name: true,
+            images: true,
+          },
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    res.json(reviews);
+  } catch (error) {
+    console.error("Error fetching my reviews:", error);
+    res.status(500).json({
+      error: "Failed to fetch your reviews",
+    });
+  }
+});
+
 // remove a product from a user's wishlist
 app.delete("/api/wishlist/:productId", requireAuth, async (req, res) => {
   const productId = Number(req.params.productId);
@@ -452,5 +484,137 @@ app.delete("/api/products/:id/reviews", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to delete review" });
   }
 });
+
+
+const addressSchema = z.object({
+  label: z.string().trim().max(50).optional().nullable(),
+  fullName: z.string().trim().min(1).max(100),
+  phone: z.string().trim().min(6).max(20),
+  addressLine1: z.string().trim().min(1).max(200),
+  addressLine2: z.string().trim().max(200).optional().nullable(),
+  city: z.string().trim().min(1).max(100),
+  postalCode: z.string().trim().max(20).optional().nullable(),
+  isDefault: z.boolean().optional().default(false),
+});
+
+// List
+app.get("/api/addresses", requireAuth, async (req, res) => {
+  try {
+    const addresses = await prisma.address.findMany({
+      where: { userId: req.userId! },
+      orderBy: [{ isDefault: "desc" }, { createdAt: "desc" }],
+    });
+    res.json(addresses);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to fetch addresses" });
+  }
+});
+
+// Create
+app.post("/api/addresses", requireAuth, async (req, res) => {
+  const parsed = addressSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid data", details: parsed.error.issues });
+  }
+
+  const userId = req.userId!;
+  const data = parsed.data;
+
+  try {
+    if (data.isDefault) {
+      await prisma.address.updateMany({
+        where: { userId },
+        data: { isDefault: false },
+      });
+    }
+
+    const address = await prisma.address.create({
+      data: {
+        userId,
+        label: data.label ?? null,
+        fullName: data.fullName,
+        phone: data.phone,
+        addressLine1: data.addressLine1,
+        addressLine2: data.addressLine2 ?? null,
+        city: data.city,
+        postalCode: data.postalCode ?? null,
+        isDefault: data.isDefault ?? false,
+      },
+    });
+
+    res.status(201).json(address);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to create address" });
+  }
+});
+
+// Update
+app.patch("/api/addresses/:id", requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) {
+    return res.status(400).json({ error: "Invalid address ID" });
+  }
+
+  const parsed = addressSchema.partial().safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid data", details: parsed.error.issues });
+  }
+
+  const userId = req.userId!;
+
+  try {
+    const existing = await prisma.address.findFirst({
+      where: { id, userId },
+    });
+    if (!existing) {
+      return res.status(404).json({ error: "Address not found" });
+    }
+
+    if (parsed.data.isDefault === true) {
+      await prisma.address.updateMany({
+        where: { userId },
+        data: { isDefault: false },
+      });
+    }
+
+    const updated = await prisma.address.update({
+      where: { id },
+      data: parsed.data,
+    });
+
+    res.json(updated);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to update address" });
+  }
+});
+
+// Delete
+app.delete("/api/addresses/:id", requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) {
+    return res.status(400).json({ error: "Invalid address ID" });
+  }
+
+  try {
+    const existing = await prisma.address.findFirst({
+      where: { id, userId: req.userId! },
+    });
+    if (!existing) {
+      return res.status(404).json({ error: "Address not found" });
+    }
+
+    await prisma.address.delete({ where: { id } });
+    res.status(204).send();
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to delete address" });
+  }
+});
+
+app.use("/api/seller", sellerRoutes);
+app.use("/api/admin", adminRoutes);
 
 export default app;
