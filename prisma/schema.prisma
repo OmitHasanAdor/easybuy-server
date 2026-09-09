@@ -180,6 +180,7 @@ model user {
 
   // Products owned by this seller
   products       Product[]
+  addresses Address[]
 }
 
 model verification {
@@ -212,4 +213,23 @@ model OrderItem {
 
   order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
   product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+model Address {
+  id           Int      @id @default(autoincrement())
+  userId       String
+  label        String?  // Home, Office, etc.
+  fullName     String
+  phone        String
+  addressLine1 String
+  addressLine2 String?
+  city         String
+  postalCode   String?
+  isDefault    Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user user @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }
