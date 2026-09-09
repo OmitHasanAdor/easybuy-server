@@ -4,6 +4,7 @@ import { z } from "zod";
 import prisma from "./prisma.ts";
 import { requireAuth } from "./middleware/requireAuth.ts";
 import sellerRoutes from "./routes/seller.ts";
+import adminRoutes from "./routes/admin.ts";
 
 const app = express();
 
@@ -614,5 +615,6 @@ app.delete("/api/addresses/:id", requireAuth, async (req, res) => {
 });
 
 app.use("/api/seller", sellerRoutes);
+app.use("/api/admin", adminRoutes);
 
 export default app;
