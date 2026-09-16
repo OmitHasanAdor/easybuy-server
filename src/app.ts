@@ -5,11 +5,13 @@ import prisma from "./prisma.ts";
 import { requireAuth } from "./middleware/requireAuth.ts";
 import sellerRoutes from "./routes/seller.ts";
 import adminRoutes from "./routes/admin.ts";
+import { initiateSslPayment } from "./lib/sslcommerz.ts";
+import { validateSslPayment } from "./lib/sslcommerz.ts";
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // SSLCommerz IPN
 
 app.get("/", (req, res) => {
   res.send("EasyBuy Server is Running");
@@ -611,6 +613,308 @@ app.delete("/api/addresses/:id", requireAuth, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to delete address" });
+  }
+});
+
+
+
+const checkoutSchema = z.object({
+  paymentMethod: z.enum(["COD", "SSLCOMMERZ"]),
+  addressId: z.coerce.number().int().positive().optional(),
+  fullName: z.string().trim().min(1).max(100).optional(),
+  phone: z.string().trim().min(6).max(20).optional(),
+  addressLine1: z.string().trim().min(1).max(200).optional(),
+  addressLine2: z.string().trim().max(200).optional().nullable(),
+  city: z.string().trim().min(1).max(100).optional(),
+  postalCode: z.string().trim().max(20).optional().nullable(),
+});
+
+app.post("/api/checkout", requireAuth, async (req, res) => {
+  const parsed = checkoutSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid data", details: parsed.error.issues });
+  }
+
+  const userId = req.userId!;
+  const { paymentMethod, addressId } = parsed.data;
+
+  try {
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) return res.status(401).json({ error: "User not found" });
+
+    const cartItems = await prisma.cartItem.findMany({
+      where: { userId },
+      include: { product: true, variant: true },
+    });
+
+    if (cartItems.length === 0) {
+      return res.status(400).json({ error: "Cart is empty" });
+    }
+
+    // Shipping
+    let shippingName = parsed.data.fullName ?? null;
+    let shippingPhone = parsed.data.phone ?? null;
+    let shippingAddress = parsed.data.addressLine1 ?? null;
+    let shippingCity = parsed.data.city ?? null;
+
+    if (addressId) {
+      const addr = await prisma.address.findFirst({
+        where: { id: addressId, userId },
+      });
+      if (!addr) return res.status(404).json({ error: "Address not found" });
+      shippingName = addr.fullName;
+      shippingPhone = addr.phone;
+      shippingAddress = [addr.addressLine1, addr.addressLine2].filter(Boolean).join(", ");
+      shippingCity = addr.city;
+    }
+
+    if (!shippingName || !shippingPhone || !shippingAddress || !shippingCity) {
+      return res.status(400).json({ error: "Shipping address is required" });
+    }
+
+    // Stock + total
+    let total = 0;
+    for (const item of cartItems) {
+      const price = item.variant?.price != null ? item.variant.price : item.product.price;
+      const stock = item.variant ? item.variant.stock : item.product.stock;
+      if (stock < item.quantity) {
+        return res.status(409).json({
+          error: `Not enough stock for "${item.product.name}"`,
+        });
+      }
+      total += price * item.quantity;
+    }
+
+    const productName = cartItems
+      .map((i) => i.product.name)
+      .join(", ")
+      .slice(0, 200);
+
+    // ── COD ──────────────────────────────────────────
+    if (paymentMethod === "COD") {
+      const order = await prisma.$transaction(async (tx) => {
+        const newOrder = await tx.order.create({
+          data: {
+            userId,
+            total,
+            status: "PENDING",
+            paymentMethod: "COD",
+            paymentStatus: "UNPAID",
+            shippingName,
+            shippingPhone,
+            shippingAddress,
+            shippingCity,
+            items: {
+              create: cartItems.map((item) => ({
+                productId: item.productId,
+                quantity: item.quantity,
+                price:
+                  item.variant?.price != null
+                    ? item.variant.price
+                    : item.product.price,
+              })),
+            },
+          },
+        });
+
+        for (const item of cartItems) {
+          if (item.variantId) {
+            await tx.productVariant.update({
+              where: { id: item.variantId },
+              data: { stock: { decrement: item.quantity } },
+            });
+          } else {
+            await tx.product.update({
+              where: { id: item.productId },
+              data: { stock: { decrement: item.quantity } },
+            });
+          }
+        }
+
+        await tx.cartItem.deleteMany({ where: { userId } });
+        return newOrder;
+      });
+
+      return res.status(201).json({
+        type: "cod",
+        orderId: order.id,
+        total: order.total,
+        message: "Order placed successfully. Pay on delivery.",
+      });
+    }
+
+    // ── SSLCOMMERZ ───────────────────────────────────
+    const tranId = `EASYBUY_${Date.now()}_${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+
+    const order = await prisma.$transaction(async (tx) => {
+      const newOrder = await tx.order.create({
+        data: {
+          userId,
+          total,
+          status: "PENDING",
+          paymentMethod: "SSLCOMMERZ",
+          paymentStatus: "UNPAID",
+          transactionId: tranId,
+          shippingName,
+          shippingPhone,
+          shippingAddress,
+          shippingCity,
+          items: {
+            create: cartItems.map((item) => ({
+              productId: item.productId,
+              quantity: item.quantity,
+              price:
+                item.variant?.price != null
+                  ? item.variant.price
+                  : item.product.price,
+            })),
+          },
+        },
+      });
+
+      // Stock: pay হলে কমাবে — অথবা এখন reserve করতে চাইলে এখানে decrement
+      // Assignment: pay success-এ stock কমাও (IPN/validate এ)
+      return newOrder;
+    });
+
+    const frontend = process.env.FRONTEND_URL || process.env.APP_URL || "http://localhost:3000";
+    const serverPublic =
+      process.env.SERVER_PUBLIC_URL ||
+      `http://localhost:${process.env.PORT || 5000}`;
+
+    const ssl = await initiateSslPayment({
+      totalAmount: total,
+      tranId,
+      productName,
+      cusName: shippingName,
+      cusEmail: user.email,
+      cusPhone: shippingPhone,
+      cusAdd1: shippingAddress,
+      cusCity: shippingCity,
+      successUrl: `${frontend}/checkout/success?tran_id=${tranId}&orderId=${order.id}`,
+      failUrl: `${frontend}/checkout/fail?tran_id=${tranId}&orderId=${order.id}`,
+      cancelUrl: `${frontend}/checkout/cancel?tran_id=${tranId}&orderId=${order.id}`,
+      ipnUrl: `${serverPublic}/api/payments/sslcommerz/ipn`,
+      valueA: String(order.id),
+      valueB: tranId,
+    });
+
+    if (ssl.status !== "SUCCESS" || !ssl.GatewayPageURL) {
+      await prisma.order.update({
+        where: { id: order.id },
+        data: { paymentStatus: "FAILED", status: "CANCELLED" },
+      });
+      return res.status(502).json({
+        error: ssl.failedreason || "Payment gateway rejected the request",
+      });
+    }
+
+    return res.status(201).json({
+      type: "redirect",
+      orderId: order.id,
+      tranId,
+      url: ssl.GatewayPageURL,
+    });
+  } catch (error) {
+    console.error("Checkout error:", error);
+    return res.status(500).json({ error: "Failed to place order" });
+  }
+});
+async function markOrderPaid(tranId: string, valId?: string) {
+  const order = await prisma.order.findFirst({
+    where: { transactionId: tranId },
+    include: { items: true },
+  });
+  if (!order) return null;
+  if (order.paymentStatus === "PAID") return order; // idempotent
+
+  return prisma.$transaction(async (tx) => {
+    const updated = await tx.order.update({
+      where: { id: order.id },
+      data: {
+        paymentStatus: "PAID",
+        status: "PENDING", // or PROCESSING
+        paidAt: new Date(),
+      },
+    });
+
+    // Reduce stock + clear cart (SSL path)
+    for (const item of order.items) {
+      await tx.product.update({
+        where: { id: item.productId },
+        data: { stock: { decrement: item.quantity } },
+      });
+    }
+    await tx.cartItem.deleteMany({ where: { userId: order.userId } });
+
+    return updated;
+  });
+}
+
+// IPN (webhook from SSLCommerz)
+app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const tranId = body.tran_id as string | undefined;
+    const valId = body.val_id as string | undefined;
+    const status = body.status as string | undefined;
+
+    if (!tranId || !valId) {
+      return res.status(400).send("Invalid IPN");
+    }
+
+    if (status === "VALID" || status === "VALIDATED") {
+      const validation = await validateSslPayment(valId);
+      if (validation.status === "VALID" || validation.status === "VALIDATED") {
+        await markOrderPaid(tranId, valId);
+      }
+    }
+
+    res.status(200).send("OK");
+  } catch (error) {
+    console.error("IPN error:", error);
+    res.status(500).send("ERROR");
+  }
+});
+
+// Success page backup validation
+app.post("/api/payments/sslcommerz/confirm", requireAuth, async (req, res) => {
+  try {
+    const { tran_id, val_id } = req.body as {
+      tran_id?: string;
+      val_id?: string;
+    };
+
+    if (!tran_id) {
+      return res.status(400).json({ error: "tran_id required" });
+    }
+
+    const order = await prisma.order.findFirst({
+      where: { transactionId: tran_id, userId: req.userId! },
+    });
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    if (order.paymentStatus === "PAID") {
+      return res.json({ ok: true, orderId: order.id, paymentStatus: "PAID" });
+    }
+
+    if (val_id) {
+      const validation = await validateSslPayment(val_id);
+      if (validation.status === "VALID" || validation.status === "VALIDATED") {
+        await markOrderPaid(tran_id, val_id);
+        return res.json({ ok: true, orderId: order.id, paymentStatus: "PAID" });
+      }
+    }
+
+    // Soft confirm: still UNPAID — frontend can poll or show pending
+    return res.json({
+      ok: true,
+      orderId: order.id,
+      paymentStatus: order.paymentStatus,
+    });
+  } catch (error) {
+    console.error("Confirm error:", error);
+    res.status(500).json({ error: "Confirmation failed" });
   }
 });
 
