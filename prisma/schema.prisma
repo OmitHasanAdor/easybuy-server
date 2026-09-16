@@ -200,6 +200,18 @@ model Order {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+// Payment fields (new)
+  paymentMethod  String?   // COD | SSLCOMMERZ
+  paymentStatus  String    @default("UNPAID") // UNPAID | PAID | FAILED
+  transactionId  String?
+  paidAt         DateTime?
+
+  // Optional shipping snapshot (address থেকে)
+  shippingName    String?
+  shippingPhone   String?
+  shippingAddress String?
+  shippingCity    String?
+
   user  user        @relation(fields: [userId], references: [id], onDelete: Cascade)
   items OrderItem[]
 }
