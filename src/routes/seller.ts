@@ -17,7 +17,7 @@ router.get("/dashboard", async (req, res) => {
   const sellerId = req.userId!;
 
   try {
-    const [productCount, lowStockCount, products, orderItems] = await Promise.all([
+    const [productCount, lowStockCount, products, orderItems, totalOrders] = await Promise.all([
       prisma.product.count({ where: { sellerId } }),
       prisma.product.count({
         where: { sellerId, stock: { lt: 5 } },
@@ -52,6 +52,10 @@ router.get("/dashboard", async (req, res) => {
         orderBy: { order: { createdAt: "desc" } },
         take: 10,
       }),
+      // every order that contains at least one of this seller's products
+      prisma.order.count({
+        where: { items: { some: { product: { sellerId } } } },
+      }),
     ]);
 
     // Calculate revenue only from DELIVERED orders
@@ -67,10 +71,6 @@ router.get("/dashboard", async (req, res) => {
       (sum, item) => sum + item.price * item.quantity,
       0
     );
-
-    // Unique orders count
-    const uniqueOrderIds = new Set(orderItems.map((item) => item.order.id));
-    const totalOrders = uniqueOrderIds.size;
 
     // Recent unique orders (last 5)
     const recentOrdersMap = new Map();
