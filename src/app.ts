@@ -9,6 +9,7 @@ import { initiateSslPayment } from "./lib/sslcommerz.ts";
 import { validateSslPayment } from "./lib/sslcommerz.ts";
 import { parseId } from "./lib/params.ts";
 import { corsOptions } from "./config/cors.ts";
+import { unitPrice } from "./lib/pricing.ts";
 
 const app = express();
 app.use(cors(corsOptions));
@@ -764,18 +765,25 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Shipping address is required" });
     }
 
-    // Stock + total
-    let total = 0;
+    // Stock check
     for (const item of cartItems) {
-      const price = item.variant?.price != null ? item.variant.price : item.product.price;
       const stock = item.variant ? item.variant.stock : item.product.stock;
       if (stock < item.quantity) {
         return res.status(409).json({
           error: `Not enough stock for "${item.product.name}"`,
         });
       }
-      total += price * item.quantity;
     }
+
+    // Prices are always worked out here from the product row, including any
+    // running sale, so the buyer pays what the storefront showed them.
+    const lineItems = cartItems.map((item) => ({
+      productId: item.productId,
+      variantId: item.variantId,
+      quantity: item.quantity,
+      price: unitPrice(item.product, item.variant),
+    }));
+    const total = lineItems.reduce((sum, line) => sum + line.price * line.quantity, 0);
 
     const productName = cartItems
       .map((i) => i.product.name)
@@ -796,16 +804,7 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
             shippingPhone,
             shippingAddress,
             shippingCity,
-            items: {
-              create: cartItems.map((item) => ({
-                productId: item.productId,
-                quantity: item.quantity,
-                price:
-                  item.variant?.price != null
-                    ? item.variant.price
-                    : item.product.price,
-              })),
-            },
+            items: { create: lineItems },
           },
         });
 
@@ -851,16 +850,7 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
           shippingPhone,
           shippingAddress,
           shippingCity,
-          items: {
-            create: cartItems.map((item) => ({
-              productId: item.productId,
-              quantity: item.quantity,
-              price:
-                item.variant?.price != null
-                  ? item.variant.price
-                  : item.product.price,
-            })),
-          },
+          items: { create: lineItems },
         },
       });
 
