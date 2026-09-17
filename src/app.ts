@@ -157,16 +157,14 @@ app.get("/api/products/:id/related", async (req, res) => {
   }
 });
 
-//orders routes
-app.get("/api/orders", async (req, res) => {
-  const { userId } = req.query;
-  if (!userId || typeof userId !== "string") {
-    return res.status(400).json({ error: "User ID is required" });
-  }
+// orders of the signed-in user. The user always comes from the session,
+// never from the query string; admins list everyone's orders through
+// /api/admin/orders instead.
+app.get("/api/orders", requireAuth, async (req, res) => {
   try {
     const orders = await prisma.order.findMany({
       where: {
-        userId,
+        userId: req.userId!,
       },
       include: {
         items: {
