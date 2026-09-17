@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
 import { z } from "zod";
 import prisma from "./prisma.ts";
@@ -17,6 +17,7 @@ import { unitPrice } from "./lib/pricing.ts";
 import { deductStock, OutOfStockError, releaseOrderStock } from "./lib/orders.ts";
 
 const app = express();
+app.disable("x-powered-by");
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // SSLCommerz IPN
@@ -1108,5 +1109,27 @@ app.post("/api/payments/sslcommerz/confirm", requireAuth, async (req, res) => {
 
 app.use("/api/seller", sellerRoutes);
 app.use("/api/admin", adminRoutes);
+
+// Unknown routes get JSON like the rest of the API instead of Express' HTML page
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
+});
+
+// Last-resort error handler: malformed JSON bodies become a 400, anything
+// else a generic 500 without leaking stack traces to the client.
+app.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    return next(error);
+  }
+  const status = (error as { status?: number })?.status;
+  if (status === 400 || (error as { type?: string })?.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "Invalid request body" });
+  }
+  if (status === 413) {
+    return res.status(413).json({ error: "Request body is too large" });
+  }
+  console.error("Unhandled error:", error);
+  res.status(500).json({ error: "Internal server error" });
+});
 
 export default app;
