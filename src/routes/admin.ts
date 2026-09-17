@@ -172,12 +172,16 @@ router.patch("/users/:id", async (req, res) => {
       return res.status(403).json({ error: "Cannot modify admin accounts" });
     }
 
-    const updated = await prisma.user.update({
+    const blocking = parsed.data.banned === true || parsed.data.status === "inactive";
+
+    const updateUser = prisma.user.update({
       where: { id: userId },
       data: {
         ...(parsed.data.status !== undefined && { status: parsed.data.status }),
         ...(parsed.data.banned !== undefined && { banned: parsed.data.banned }),
         ...(parsed.data.banReason !== undefined && { banReason: parsed.data.banReason }),
+        // an admin ban lasts until it is lifted, so drop any old expiry
+        ...(parsed.data.banned !== undefined && { banExpires: null }),
       },
       select: {
         id: true,
@@ -189,6 +193,14 @@ router.patch("/users/:id", async (req, res) => {
         banReason: true,
       },
     });
+
+    // Sign the user out everywhere when they are banned or deactivated
+    const [updated] = blocking
+      ? await prisma.$transaction([
+          updateUser,
+          prisma.session.deleteMany({ where: { userId } }),
+        ])
+      : [await updateUser];
 
     res.json(updated);
   } catch (error) {
