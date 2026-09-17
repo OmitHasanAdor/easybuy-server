@@ -706,7 +706,12 @@ app.patch("/api/addresses/:id", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Invalid address ID" });
   }
 
-  const parsed = addressSchema.partial().safeParse(req.body);
+  // .partial() keeps .default(false) on isDefault, which silently removed the
+  // default flag whenever any other field was edited; drop that default here
+  const parsed = addressSchema
+    .extend({ isDefault: z.boolean().optional() })
+    .partial()
+    .safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: "Invalid data", details: parsed.error.issues });
   }
