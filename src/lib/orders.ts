@@ -67,3 +67,21 @@ export async function restoreStock(tx: Tx, lines: StockLine[]) {
     await changeStock(tx, line, "increment");
   }
 }
+
+// Gives a cancelled order's stock back, at most once. The stockDeducted
+// flag is cleared by the same conditional update that grants the restore,
+// so a retried or concurrent cancel finds nothing left to give back.
+export async function releaseOrderStock(tx: Tx, orderId: number) {
+  const released = await tx.order.updateMany({
+    where: { id: orderId, stockDeducted: true },
+    data: { stockDeducted: false },
+  });
+  if (released.count === 0) return false;
+
+  const items = await tx.orderItem.findMany({
+    where: { orderId },
+    select: { productId: true, variantId: true, quantity: true },
+  });
+  await restoreStock(tx, items);
+  return true;
+}

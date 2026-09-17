@@ -7,6 +7,7 @@ import {
   canTransition,
   ORDER_STATUSES,
   ORDER_TRANSITIONS,
+  releaseOrderStock,
   type OrderStatus,
 } from "../lib/orders.ts";
 
@@ -372,6 +373,10 @@ router.patch("/orders/:id", async (req, res) => {
         data: { status: next },
       });
       if (moved.count === 0) return null;
+
+      if (next === "CANCELLED") {
+        await releaseOrderStock(tx, id);
+      }
 
       return tx.order.findUnique({
         where: { id },
