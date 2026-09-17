@@ -8,9 +8,10 @@ import adminRoutes from "./routes/admin.ts";
 import { initiateSslPayment } from "./lib/sslcommerz.ts";
 import { validateSslPayment } from "./lib/sslcommerz.ts";
 import { parseId } from "./lib/params.ts";
+import { corsOptions } from "./config/cors.ts";
 
 const app = express();
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // SSLCommerz IPN
 
