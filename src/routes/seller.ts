@@ -340,6 +340,15 @@ router.delete("/products/:id", async (req, res) => {
       return res.status(404).json({ error: "Product not found or you don't own it" });
     }
 
+    // Order items cascade with the product, so deleting a product that was
+    // ever ordered would silently rewrite past orders and revenue.
+    const orderCount = await prisma.orderItem.count({ where: { productId } });
+    if (orderCount > 0) {
+      return res.status(409).json({
+        error: "This product has orders and can't be deleted. Set its stock to 0 to stop selling it.",
+      });
+    }
+
     await prisma.product.delete({ where: { id: productId } });
     res.status(204).send();
   } catch (error) {
