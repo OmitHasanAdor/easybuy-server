@@ -9,6 +9,7 @@ import {
   initiateSslPayment,
   paymentMatchesOrder,
   validateSslPayment,
+  verifyIpnSignature,
 } from "./lib/sslcommerz.ts";
 import { parseId } from "./lib/params.ts";
 import { corsOptions } from "./config/cors.ts";
@@ -1009,6 +1010,8 @@ async function markOrderPaid(tranId: string) {
   });
 }
 
+const UNSUCCESSFUL_PAYMENT_STATUSES = new Set(["FAILED", "CANCELLED", "EXPIRED", "UNATTEMPTED"]);
+
 // IPN (webhook from SSLCommerz)
 app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
   try {
@@ -1017,11 +1020,11 @@ app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
     const valId = body.val_id as string | undefined;
     const status = body.status as string | undefined;
 
-    if (!tranId || !valId) {
+    if (!tranId) {
       return res.status(400).send("Invalid IPN");
     }
 
-    if (status === "VALID" || status === "VALIDATED") {
+    if ((status === "VALID" || status === "VALIDATED") && valId) {
       const [order, validation] = await Promise.all([
         prisma.order.findUnique({ where: { transactionId: tranId } }),
         validateSslPayment(valId),
@@ -1030,6 +1033,17 @@ app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
         await markOrderPaid(tranId);
       } else {
         console.warn("IPN ignored: validation does not match order", { tranId });
+      }
+    } else if (status && UNSUCCESSFUL_PAYMENT_STATUSES.has(status)) {
+      if (verifyIpnSignature(body)) {
+        // close the unpaid order so it doesn't sit in PENDING forever;
+        // no stock was taken for it yet
+        await prisma.order.updateMany({
+          where: { transactionId: tranId, status: "PENDING", paymentStatus: { not: "PAID" } },
+          data: { status: "CANCELLED", paymentStatus: "FAILED" },
+        });
+      } else {
+        console.warn("IPN ignored: invalid signature", { tranId, status });
       }
     }
 

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 const STORE_ID = process.env.SSLCOMMERZ_STORE_ID!;
 const STORE_PASSWORD = process.env.SSLCOMMERZ_STORE_PASSWORD!;
 const ENV = process.env.SSLCOMMERZ_ENV || "sandbox";
@@ -77,6 +79,34 @@ export async function initiateSslPayment(
   }
 
   return res.json() as Promise<InitiateSslResult>;
+}
+
+const md5 = (value: string) => createHash("md5").update(value).digest("hex");
+
+// IPN posts are signed by SSLCommerz: verify_sign is the md5 of the fields
+// named in verify_key plus md5(store password), joined as key=value pairs
+// sorted by key. Used for FAILED/CANCELLED notifications, which have no
+// val_id that could be checked through the validation API instead.
+export function verifyIpnSignature(body: Record<string, unknown>) {
+  const sign = body.verify_sign;
+  const keys = body.verify_key;
+  if (typeof sign !== "string" || typeof keys !== "string" || !STORE_PASSWORD) {
+    return false;
+  }
+
+  const fields: Record<string, string> = {};
+  for (const key of keys.split(",")) {
+    const value = body[key];
+    if (typeof value === "string") fields[key] = value;
+  }
+  fields.store_passwd = md5(STORE_PASSWORD);
+
+  const hashString = Object.keys(fields)
+    .sort()
+    .map((key) => `${key}=${fields[key]}`)
+    .join("&");
+
+  return md5(hashString) === sign;
 }
 
 export type ValidateSslResult = {
