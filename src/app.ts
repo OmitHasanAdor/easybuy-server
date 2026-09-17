@@ -425,9 +425,22 @@ app.patch("/api/cart/:id", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Invalid body", details: parsed.error.issues });
   }
   try {
-    const existing = await prisma.cartItem.findUnique({ where: { id } });
+    const existing = await prisma.cartItem.findUnique({
+      where: { id },
+      include: {
+        product: { select: { stock: true } },
+        variant: { select: { stock: true } },
+      },
+    });
     if (!existing || existing.userId !== req.userId) {
       return res.status(404).json({ error: "Cart item not found" });
+    }
+    const stock = existing.variant ? existing.variant.stock : existing.product.stock;
+    if (parsed.data.quantity > stock) {
+      return res.status(409).json({
+        error: stockErrorMessage(stock, 0),
+        available: stock,
+      });
     }
     const item = await prisma.cartItem.update({
       where: { id },
