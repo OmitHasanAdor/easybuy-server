@@ -10,6 +10,7 @@ import { validateSslPayment } from "./lib/sslcommerz.ts";
 import { parseId } from "./lib/params.ts";
 import { corsOptions } from "./config/cors.ts";
 import { unitPrice } from "./lib/pricing.ts";
+import { deductStock, OutOfStockError } from "./lib/orders.ts";
 
 const app = express();
 app.use(cors(corsOptions));
@@ -793,6 +794,10 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
     // ── COD ──────────────────────────────────────────
     if (paymentMethod === "COD") {
       const order = await prisma.$transaction(async (tx) => {
+        // throws OutOfStockError (and rolls everything back) if another
+        // buyer got the last units after the check above
+        await deductStock(tx, lineItems);
+
         const newOrder = await tx.order.create({
           data: {
             userId,
@@ -800,6 +805,7 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
             status: "PENDING",
             paymentMethod: "COD",
             paymentStatus: "UNPAID",
+            stockDeducted: true,
             shippingName,
             shippingPhone,
             shippingAddress,
@@ -808,21 +814,10 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
           },
         });
 
-        for (const item of cartItems) {
-          if (item.variantId) {
-            await tx.productVariant.update({
-              where: { id: item.variantId },
-              data: { stock: { decrement: item.quantity } },
-            });
-          } else {
-            await tx.product.update({
-              where: { id: item.productId },
-              data: { stock: { decrement: item.quantity } },
-            });
-          }
-        }
-
-        await tx.cartItem.deleteMany({ where: { userId } });
+        // only the rows that went into this order
+        await tx.cartItem.deleteMany({
+          where: { id: { in: cartItems.map((item) => item.id) } },
+        });
         return newOrder;
       });
 
@@ -898,6 +893,9 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
       url: ssl.GatewayPageURL,
     });
   } catch (error) {
+    if (error instanceof OutOfStockError) {
+      return res.status(409).json({ error: "Some items in your cart just sold out" });
+    }
     console.error("Checkout error:", error);
     return res.status(500).json({ error: "Failed to place order" });
   }
