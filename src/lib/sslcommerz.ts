@@ -12,14 +12,6 @@ const VALIDATION_URL = isLive
   ? "https://securepay.sslcommerz.com/validator/api/validationserverAPI.php"
   : "https://sandbox.sslcommerz.com/validator/api/validationserverAPI.php";
 
-  console.log("SSL check", {
-  id: STORE_ID,
-  idLen: STORE_ID?.length,
-  passLen: STORE_PASSWORD?.length,
-  env: ENV,
-  initUrl: INIT_URL,
-});
-
 export type InitiateSslParams = {
   totalAmount: number;
   tranId: string;
@@ -99,6 +91,10 @@ export type ValidateSslResult = {
 export async function validateSslPayment(
   valId: string
 ): Promise<ValidateSslResult> {
+  if (!STORE_ID || !STORE_PASSWORD) {
+    throw new Error("SSLCommerz credentials missing in env");
+  }
+
   const url = new URL(VALIDATION_URL);
   url.searchParams.set("val_id", valId);
   url.searchParams.set("store_id", STORE_ID);
