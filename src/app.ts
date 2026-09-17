@@ -186,28 +186,46 @@ app.get("/api/orders", requireAuth, async (req, res) => {
   }
 });
 
-// user role route
-app.get("/user-role", async (req, res) => {
-  const { email } = req.query;
-  if (!email || typeof email !== "string") {
-    return res.status(400).json({ error: "Email is required" });
-  }
+const publicUserSelect = {
+  id: true,
+  name: true,
+  email: true,
+  role: true,
+  status: true,
+} as const;
+
+// the signed-in user's own profile and role
+app.get("/api/me", requireAuth, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
-      where: { email },
-      select: {
-        name: true,
-        email: true,
-        role: true,
-        status: true,
-      },
+      where: { id: req.userId! },
+      select: publicUserSelect,
     });
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
-    // block banned/inactive accounts from getting a role back
-    if (user.status !== "active") {
-      return res.status(403).json({ error: "Account is not active" });
+    return res.status(200).json(user);
+  } catch (error) {
+    console.error("Error fetching current user:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// user role route (kept for older clients). Returns the caller's own role;
+// only admins may look up another account by email.
+app.get("/user-role", requireAuth, async (req, res) => {
+  const email = typeof req.query.email === "string" ? req.query.email.trim() : "";
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: email && req.userRole === "admin" ? { email } : { id: req.userId! },
+      select: publicUserSelect,
+    });
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (email && req.userRole !== "admin" && user.email.toLowerCase() !== email.toLowerCase()) {
+      return res.status(403).json({ error: "You can only look up your own account" });
     }
     return res.status(200).json(user);
   } catch (error) {
