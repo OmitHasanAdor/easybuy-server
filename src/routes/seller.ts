@@ -378,20 +378,26 @@ router.get("/inventory", async (req, res) => {
   }
 });
 
+// Stock must be a whole, non-negative number. Number("2.5") used to pass
+// and then failed inside Prisma because the column is an INT.
+const stockBodySchema = z.object({
+  stock: z.coerce.number().int().min(0).max(1_000_000),
+});
+
 // Update product stock
 router.patch("/products/:id/stock", async (req, res) => {
   const sellerId = req.userId!;
   const productId = parseId(req.params.id);
-  const { stock } = req.body;
 
   if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
 
-  const stockNum = Number(stock);
-  if (!Number.isFinite(stockNum) || stockNum < 0) {
-    return res.status(400).json({ error: "Invalid stock value" });
+  const parsedStock = stockBodySchema.safeParse(req.body);
+  if (!parsedStock.success) {
+    return res.status(400).json({ error: "Stock must be a whole number of 0 or more" });
   }
+  const stockNum = parsedStock.data.stock;
 
   try {
     const product = await prisma.product.findFirst({
@@ -418,16 +424,16 @@ router.patch("/products/:id/stock", async (req, res) => {
 router.patch("/variants/:id/stock", async (req, res) => {
   const sellerId = req.userId!;
   const variantId = parseId(req.params.id);
-  const { stock } = req.body;
 
   if (variantId === null) {
     return res.status(400).json({ error: "Invalid variant ID" });
   }
 
-  const stockNum = Number(stock);
-  if (!Number.isFinite(stockNum) || stockNum < 0) {
-    return res.status(400).json({ error: "Invalid stock value" });
+  const parsedStock = stockBodySchema.safeParse(req.body);
+  if (!parsedStock.success) {
+    return res.status(400).json({ error: "Stock must be a whole number of 0 or more" });
   }
+  const stockNum = parsedStock.data.stock;
 
   try {
     const variant = await prisma.productVariant.findUnique({
