@@ -903,34 +903,53 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "Failed to place order" });
   }
 });
-async function markOrderPaid(tranId: string, valId?: string) {
-  const order = await prisma.order.findFirst({
-    where: { transactionId: tranId },
-    include: { items: true },
-  });
-  if (!order) return null;
-  if (order.paymentStatus === "PAID") return order; // idempotent
-
+// Marks an online order as paid and takes its items out of stock.
+// The IPN and the success page may both call this for the same payment,
+// so the UNPAID -> PAID switch is a single conditional update: only the
+// call that actually flips it goes on to touch stock and the cart.
+async function markOrderPaid(tranId: string) {
   return prisma.$transaction(async (tx) => {
-    const updated = await tx.order.update({
-      where: { id: order.id },
-      data: {
-        paymentStatus: "PAID",
-        status: "PENDING", // or PROCESSING
-        paidAt: new Date(),
+    const claimed = await tx.order.updateMany({
+      where: { transactionId: tranId, paymentStatus: { not: "PAID" } },
+      data: { paymentStatus: "PAID", paidAt: new Date() },
+    });
+
+    const order = await tx.order.findUnique({
+      where: { transactionId: tranId },
+      include: { items: true },
+    });
+    if (!order || claimed.count === 0) return order;
+
+    if (order.status === "CANCELLED") {
+      // Money arrived for an order that was already cancelled. Keep it
+      // cancelled and leave stock alone so an admin can refund it.
+      console.warn("Payment received for a cancelled order", { orderId: order.id });
+      return order;
+    }
+
+    try {
+      await deductStock(tx, order.items);
+      await tx.order.update({ where: { id: order.id }, data: { stockDeducted: true } });
+    } catch (error) {
+      if (!(error instanceof OutOfStockError)) throw error;
+      // The buyer has already paid, so the payment stays recorded. Stock ran
+      // out while they were on the gateway page; an admin has to restock or
+      // cancel and refund.
+      console.warn("Paid order could not be taken from stock", { orderId: order.id });
+    }
+
+    // Remove what was bought from the cart, keep anything added since
+    await tx.cartItem.deleteMany({
+      where: {
+        userId: order.userId,
+        OR: order.items.map((item) => ({
+          productId: item.productId,
+          variantId: item.variantId,
+        })),
       },
     });
 
-    // Reduce stock + clear cart (SSL path)
-    for (const item of order.items) {
-      await tx.product.update({
-        where: { id: item.productId },
-        data: { stock: { decrement: item.quantity } },
-      });
-    }
-    await tx.cartItem.deleteMany({ where: { userId: order.userId } });
-
-    return updated;
+    return order;
   });
 }
 
@@ -952,7 +971,7 @@ app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
         validateSslPayment(valId),
       ]);
       if (order && paymentMatchesOrder(validation, order)) {
-        await markOrderPaid(tranId, valId);
+        await markOrderPaid(tranId);
       } else {
         console.warn("IPN ignored: validation does not match order", { tranId });
       }
@@ -989,7 +1008,7 @@ app.post("/api/payments/sslcommerz/confirm", requireAuth, async (req, res) => {
     if (val_id) {
       const validation = await validateSslPayment(val_id);
       if (paymentMatchesOrder(validation, order)) {
-        await markOrderPaid(tran_id, val_id);
+        await markOrderPaid(tran_id);
         return res.json({ ok: true, orderId: order.id, paymentStatus: "PAID" });
       }
     }
