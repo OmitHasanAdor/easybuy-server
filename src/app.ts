@@ -1057,10 +1057,10 @@ app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
 // Success page backup validation
 app.post("/api/payments/sslcommerz/confirm", requireAuth, async (req, res) => {
   try {
-    const { tran_id, val_id } = req.body as {
-      tran_id?: string;
-      val_id?: string;
-    };
+    // Express 5 leaves req.body undefined when no JSON body was sent
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const tran_id = typeof body.tran_id === "string" ? body.tran_id : undefined;
+    const val_id = typeof body.val_id === "string" ? body.val_id : undefined;
 
     if (!tran_id) {
       return res.status(400).json({ error: "tran_id required" });
