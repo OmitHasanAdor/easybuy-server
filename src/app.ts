@@ -7,6 +7,7 @@ import sellerRoutes from "./routes/seller.ts";
 import adminRoutes from "./routes/admin.ts";
 import { initiateSslPayment } from "./lib/sslcommerz.ts";
 import { validateSslPayment } from "./lib/sslcommerz.ts";
+import { parseId } from "./lib/params.ts";
 
 const app = express();
 app.use(cors());
@@ -103,9 +104,13 @@ app.get("/api/categories", async (req, res) => {
 
 // product details, including variants and reviews
 app.get("/api/products/:id", async (req, res) => {
+  const id = parseId(req.params.id);
+  if (id === null) {
+    return res.status(404).json({ message: "Product not found" });
+  }
   try {
     const product = await prisma.product.findUnique({
-      where: { id: Number(req.params.id) },
+      where: { id },
       include: {
         variants: true,
         reviews: {
@@ -126,8 +131,11 @@ app.get("/api/products/:id", async (req, res) => {
 
 // related products
 app.get("/api/products/:id/related", async (req, res) => {
+  const productId = parseId(req.params.id);
+  if (productId === null) {
+    return res.status(404).json({ message: "Product not found" });
+  }
   try {
-    const productId = Number(req.params.id);
     const current = await prisma.product.findUnique({ where: { id: productId } });
     if (!current) {
       return res.status(404).json({ message: "Product not found" });
