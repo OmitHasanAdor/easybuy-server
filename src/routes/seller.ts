@@ -134,6 +134,9 @@ router.get("/products", async (req, res) => {
 // ======================
 // 3. ADD NEW PRODUCT
 // ======================
+// Whitelist of fields a seller may set. Zod drops unknown keys, so flags
+// that only admins control (isBestSeller, sellerId, ...) are ignored even
+// if a client sends them.
 const createProductSchema = z.object({
   name: z.string().trim().min(1).max(200),
   description: z.string().trim().min(1),
@@ -144,7 +147,6 @@ const createProductSchema = z.object({
   hasVariants: z.boolean().default(false),
   discountPercent: z.coerce.number().int().min(0).max(100).optional().nullable(),
   saleEndsAt: z.coerce.date().optional().nullable(),
-  isBestSeller: z.boolean().default(false),
   variants: z
     .array(
       z.object({
@@ -191,7 +193,6 @@ router.post("/products", async (req, res) => {
         hasVariants: data.hasVariants,
         discountPercent: data.discountPercent ?? null,
         saleEndsAt: data.saleEndsAt ?? null,
-        isBestSeller: data.isBestSeller,
         sellerId,
         ...(data.hasVariants && data.variants.length > 0
           ? {
