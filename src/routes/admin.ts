@@ -259,6 +259,40 @@ router.delete("/products/:id", async (req, res) => {
   }
 });
 
+// Only admins decide which products carry the Best Seller badge
+const productFlagsSchema = z.object({
+  isBestSeller: z.boolean(),
+});
+
+router.patch("/products/:id", async (req, res) => {
+  const id = parseId(req.params.id);
+  if (id === null) {
+    return res.status(400).json({ error: "Invalid product ID" });
+  }
+
+  const parsed = productFlagsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid data", details: parsed.error.issues });
+  }
+
+  try {
+    const product = await prisma.product.findUnique({ where: { id }, select: { id: true } });
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const updated = await prisma.product.update({
+      where: { id },
+      data: { isBestSeller: parsed.data.isBestSeller },
+      select: { id: true, name: true, isBestSeller: true },
+    });
+    res.json(updated);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to update product" });
+  }
+});
+
 // ======================
 // ALL ORDERS
 // ======================
