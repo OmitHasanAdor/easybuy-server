@@ -262,6 +262,14 @@ app.post("/api/wishlist", requireAuth, async (req, res) => {
   const { productId } = parsed.data;
   const userId = req.userId!;
   try {
+    const product = await prisma.product.findUnique({
+      where: { id: productId },
+      select: { id: true },
+    });
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
     const entry = await prisma.wishlist.upsert({
       where: { userId_productId: { userId, productId } },
       update: {},
