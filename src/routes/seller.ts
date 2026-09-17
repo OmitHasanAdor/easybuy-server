@@ -135,6 +135,12 @@ router.get("/products", async (req, res) => {
 // ======================
 // 3. ADD NEW PRODUCT
 // ======================
+const discountPercentSchema = z.coerce
+  .number()
+  .int()
+  .min(0)
+  .max(MAX_DISCOUNT_PERCENT, `Discount cannot be more than ${MAX_DISCOUNT_PERCENT}%`);
+
 // Whitelist of fields a seller may set. Zod drops unknown keys, so flags
 // that only admins control (isBestSeller, sellerId, ...) are ignored even
 // if a client sends them.
@@ -146,13 +152,7 @@ const createProductSchema = z.object({
   images: z.array(z.string().url()).default([]),
   stock: z.coerce.number().int().min(0).default(0),
   hasVariants: z.boolean().default(false),
-  discountPercent: z.coerce
-    .number()
-    .int()
-    .min(0)
-    .max(MAX_DISCOUNT_PERCENT, `Discount cannot be more than ${MAX_DISCOUNT_PERCENT}%`)
-    .optional()
-    .nullable(),
+  discountPercent: discountPercentSchema.optional().nullable(),
   saleEndsAt: z.coerce.date().optional().nullable(),
   variants: z
     .array(
@@ -222,6 +222,101 @@ router.post("/products", async (req, res) => {
   } catch (error) {
     console.error("Error creating product:", error);
     res.status(500).json({ error: "Failed to create product" });
+  }
+});
+
+// ======================
+// 3b. EDIT PRODUCT
+// ======================
+router.get("/products/:id", async (req, res) => {
+  const sellerId = req.userId!;
+  const productId = parseId(req.params.id);
+
+  if (productId === null) {
+    return res.status(400).json({ error: "Invalid product ID" });
+  }
+
+  try {
+    const product = await prisma.product.findFirst({
+      where: { id: productId, sellerId },
+      include: { variants: true },
+    });
+
+    if (!product) {
+      return res.status(404).json({ error: "Product not found or you don't own it" });
+    }
+
+    res.json(product);
+  } catch (error) {
+    console.error("Error fetching seller product:", error);
+    res.status(500).json({ error: "Failed to fetch product" });
+  }
+});
+
+// Same whitelist idea as create: listing details only. Stock is managed
+// from the inventory endpoints, and the Best Seller badge by admins.
+const updateProductSchema = z.object({
+  name: z.string().trim().min(1).max(200).optional(),
+  description: z.string().trim().min(1).optional(),
+  price: z.coerce.number().positive().optional(),
+  category: z.string().trim().min(1).optional(),
+  images: z.array(z.string().url()).optional(),
+  discountPercent: discountPercentSchema.optional().nullable(),
+  saleEndsAt: z.coerce.date().optional().nullable(),
+});
+
+router.patch("/products/:id", async (req, res) => {
+  const sellerId = req.userId!;
+  const productId = parseId(req.params.id);
+
+  if (productId === null) {
+    return res.status(400).json({ error: "Invalid product ID" });
+  }
+
+  const parsed = updateProductSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Invalid data",
+      details: parsed.error.issues,
+    });
+  }
+
+  const data = parsed.data;
+
+  try {
+    const product = await prisma.product.findFirst({
+      where: { id: productId, sellerId },
+      select: { id: true },
+    });
+
+    if (!product) {
+      return res.status(404).json({ error: "Product not found or you don't own it" });
+    }
+
+    if (data.name) {
+      const clash = await prisma.product.findFirst({
+        where: {
+          sellerId,
+          id: { not: productId },
+          name: { equals: data.name, mode: "insensitive" },
+        },
+        select: { id: true },
+      });
+      if (clash) {
+        return res.status(409).json({ error: "You already have a product with this name" });
+      }
+    }
+
+    const updated = await prisma.product.update({
+      where: { id: productId },
+      data,
+      include: { variants: true },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    console.error("Error updating product:", error);
+    res.status(500).json({ error: "Failed to update product" });
   }
 });
 
