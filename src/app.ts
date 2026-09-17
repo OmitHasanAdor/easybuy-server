@@ -897,8 +897,7 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
         },
       });
 
-      // Stock: pay হলে কমাবে — অথবা এখন reserve করতে চাইলে এখানে decrement
-      // Assignment: pay success-এ stock কমাও (IPN/validate এ)
+      // Stock is taken once the payment is verified (see markOrderPaid)
       return newOrder;
     });
 
@@ -907,28 +906,40 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
       process.env.SERVER_PUBLIC_URL ||
       `http://localhost:${process.env.PORT || 5000}`;
 
-    const ssl = await initiateSslPayment({
-      totalAmount: total,
-      tranId,
-      productName,
-      cusName: shippingName,
-      cusEmail: user.email,
-      cusPhone: shippingPhone,
-      cusAdd1: shippingAddress,
-      cusCity: shippingCity,
-      successUrl: `${frontend}/checkout/success?tran_id=${tranId}&orderId=${order.id}`,
-      failUrl: `${frontend}/checkout/fail?tran_id=${tranId}&orderId=${order.id}`,
-      cancelUrl: `${frontend}/checkout/cancel?tran_id=${tranId}&orderId=${order.id}`,
-      ipnUrl: `${serverPublic}/api/payments/sslcommerz/ipn`,
-      valueA: String(order.id),
-      valueB: tranId,
-    });
-
-    if (ssl.status !== "SUCCESS" || !ssl.GatewayPageURL) {
-      await prisma.order.update({
+    const closeUnpaidOrder = () =>
+      prisma.order.update({
         where: { id: order.id },
         data: { paymentStatus: "FAILED", status: "CANCELLED" },
       });
+
+    let ssl: Awaited<ReturnType<typeof initiateSslPayment>>;
+    try {
+      ssl = await initiateSslPayment({
+        totalAmount: total,
+        tranId,
+        productName,
+        cusName: shippingName,
+        cusEmail: user.email,
+        cusPhone: shippingPhone,
+        cusAdd1: shippingAddress,
+        cusCity: shippingCity,
+        successUrl: `${frontend}/checkout/success?tran_id=${tranId}&orderId=${order.id}`,
+        failUrl: `${frontend}/checkout/fail?tran_id=${tranId}&orderId=${order.id}`,
+        cancelUrl: `${frontend}/checkout/cancel?tran_id=${tranId}&orderId=${order.id}`,
+        ipnUrl: `${serverPublic}/api/payments/sslcommerz/ipn`,
+        valueA: String(order.id),
+        valueB: tranId,
+      });
+    } catch (error) {
+      // gateway unreachable or misconfigured: don't leave a dangling
+      // PENDING order behind that an admin might ship unpaid
+      console.error("SSLCommerz init error:", error);
+      await closeUnpaidOrder();
+      return res.status(502).json({ error: "Payment gateway is unavailable, please try again" });
+    }
+
+    if (ssl.status !== "SUCCESS" || !ssl.GatewayPageURL) {
+      await closeUnpaidOrder();
       return res.status(502).json({
         error: ssl.failedreason || "Payment gateway rejected the request",
       });
