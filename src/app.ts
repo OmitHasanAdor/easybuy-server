@@ -13,7 +13,7 @@ import {
 import { parseId } from "./lib/params.ts";
 import { corsOptions } from "./config/cors.ts";
 import { unitPrice } from "./lib/pricing.ts";
-import { deductStock, OutOfStockError } from "./lib/orders.ts";
+import { deductStock, OutOfStockError, releaseOrderStock } from "./lib/orders.ts";
 
 const app = express();
 app.use(cors(corsOptions));
@@ -188,6 +188,51 @@ app.get("/api/orders", requireAuth, async (req, res) => {
     return res.status(500).json({
       error: "Failed to fetch orders",
     });
+  }
+});
+
+// Buyers may cancel their own order while it is still PENDING. Orders that
+// were already paid online need a refund, so those go through support.
+app.post("/api/orders/:id/cancel", requireAuth, async (req, res) => {
+  const id = parseId(req.params.id);
+  if (id === null) {
+    return res.status(400).json({ error: "Invalid order ID" });
+  }
+
+  try {
+    const order = await prisma.order.findFirst({
+      where: { id, userId: req.userId! },
+      select: { id: true, status: true, paymentStatus: true },
+    });
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    if (order.status !== "PENDING") {
+      return res.status(400).json({ error: "Only pending orders can be cancelled" });
+    }
+    if (order.paymentStatus === "PAID") {
+      return res.status(400).json({
+        error: "This order is already paid. Please contact support to cancel it.",
+      });
+    }
+
+    const cancelled = await prisma.$transaction(async (tx) => {
+      const moved = await tx.order.updateMany({
+        where: { id, status: "PENDING", paymentStatus: { not: "PAID" } },
+        data: { status: "CANCELLED" },
+      });
+      if (moved.count === 0) return false;
+      await releaseOrderStock(tx, id);
+      return true;
+    });
+
+    if (!cancelled) {
+      return res.status(409).json({ error: "The order was just updated, please refresh" });
+    }
+    res.json({ ok: true, orderId: id, status: "CANCELLED" });
+  } catch (error) {
+    console.error("Error cancelling order:", error);
+    res.status(500).json({ error: "Failed to cancel order" });
   }
 });
 
