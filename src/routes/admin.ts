@@ -3,6 +3,12 @@ import { z } from "zod";
 import prisma from "../prisma.ts";
 import { requireAdmin } from "../middleware/requireAdmin.ts";
 import { parseId } from "../lib/params.ts";
+import {
+  canTransition,
+  ORDER_STATUSES,
+  ORDER_TRANSITIONS,
+  type OrderStatus,
+} from "../lib/orders.ts";
 
 const router = Router();
 router.use(requireAdmin);
@@ -323,7 +329,7 @@ router.get("/orders", async (req, res) => {
 });
 
 const orderStatusSchema = z.object({
-  status: z.enum(["PENDING", "SHIPPED", "DELIVERED", "CANCELLED"]),
+  status: z.enum(ORDER_STATUSES),
 });
 
 router.patch("/orders/:id", async (req, res) => {
@@ -343,14 +349,42 @@ router.patch("/orders/:id", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    const updated = await prisma.order.update({
-      where: { id },
-      data: { status: parsed.data.status },
-      include: {
-        user: { select: { name: true, email: true } },
-        items: true,
-      },
+    const next = parsed.data.status;
+    if (!canTransition(order.status, next)) {
+      return res.status(400).json({
+        error: `Cannot change an order from ${order.status} to ${next}`,
+        allowed: ORDER_TRANSITIONS[order.status as OrderStatus] ?? [],
+      });
+    }
+
+    if (
+      next === "SHIPPED" &&
+      order.paymentMethod === "SSLCOMMERZ" &&
+      order.paymentStatus !== "PAID"
+    ) {
+      return res.status(400).json({ error: "This online order has not been paid yet" });
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      // Only apply the change if nobody moved the order in the meantime
+      const moved = await tx.order.updateMany({
+        where: { id, status: order.status },
+        data: { status: next },
+      });
+      if (moved.count === 0) return null;
+
+      return tx.order.findUnique({
+        where: { id },
+        include: {
+          user: { select: { name: true, email: true } },
+          items: true,
+        },
+      });
     });
+
+    if (!updated) {
+      return res.status(409).json({ error: "The order was just updated, please refresh" });
+    }
 
     res.json(updated);
   } catch (error) {

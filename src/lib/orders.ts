@@ -2,6 +2,22 @@ import type { Prisma } from "../generated/prisma/client.ts";
 
 type Tx = Prisma.TransactionClient;
 
+export const ORDER_STATUSES = ["PENDING", "SHIPPED", "DELIVERED", "CANCELLED"] as const;
+export type OrderStatus = (typeof ORDER_STATUSES)[number];
+
+// Allowed status changes. An order moves forward only; DELIVERED and
+// CANCELLED are final, and cancelling is only possible before delivery.
+export const ORDER_TRANSITIONS: Record<OrderStatus, readonly OrderStatus[]> = {
+  PENDING: ["SHIPPED", "CANCELLED"],
+  SHIPPED: ["DELIVERED", "CANCELLED"],
+  DELIVERED: [],
+  CANCELLED: [],
+};
+
+export function canTransition(from: string, to: OrderStatus) {
+  return (ORDER_TRANSITIONS[from as OrderStatus] ?? []).includes(to);
+}
+
 export type StockLine = {
   productId: number;
   variantId: number | null;
