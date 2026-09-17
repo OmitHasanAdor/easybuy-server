@@ -334,6 +334,14 @@ app.get("/api/cart", requireAuth, async (req, res) => {
   }
 });
 
+function stockErrorMessage(stock: number, alreadyInCart: number) {
+  if (stock <= 0) return "This item is out of stock";
+  if (alreadyInCart > 0) {
+    return `Only ${stock} in stock and you already have ${alreadyInCart} in your cart`;
+  }
+  return `Only ${stock} in stock`;
+}
+
 const addCartBodySchema = z.object({
   productId: z.coerce.number().int().positive(),
   variantId: z.coerce.number().int().positive().nullable().optional(),
@@ -351,27 +359,38 @@ app.post("/api/cart", requireAuth, async (req, res) => {
   const userId = req.userId!;
 
   try {
+    const existing = await prisma.cartItem.findFirst({
+      where: { userId, productId, variantId },
+    });
+    // what the cart row would hold after this request
+    const requestedTotal = (existing?.quantity ?? 0) + quantity;
+
     if (variantId) {
       const variant = await prisma.productVariant.findUnique({ where: { id: variantId } });
       if (!variant || variant.productId !== productId) {
         return res.status(400).json({ error: "Variant does not belong to this product" });
       }
-      if (variant.stock < quantity) {
-        return res.status(409).json({ error: "Not enough stock for this variant" });
+      if (variant.stock < requestedTotal) {
+        return res.status(409).json({
+          error: stockErrorMessage(variant.stock, existing?.quantity ?? 0),
+          available: variant.stock,
+        });
       }
     } else {
       const product = await prisma.product.findUnique({ where: { id: productId } });
       if (!product) {
         return res.status(404).json({ error: "Product not found" });
       }
-      if (product.stock < quantity) {
-        return res.status(409).json({ error: "Not enough stock" });
+      if (product.hasVariants) {
+        return res.status(400).json({ error: "Please choose a size or color first" });
+      }
+      if (product.stock < requestedTotal) {
+        return res.status(409).json({
+          error: stockErrorMessage(product.stock, existing?.quantity ?? 0),
+          available: product.stock,
+        });
       }
     }
-
-    const existing = await prisma.cartItem.findFirst({
-      where: { userId, productId, variantId },
-    });
 
     const item = existing
       ? await prisma.cartItem.update({
