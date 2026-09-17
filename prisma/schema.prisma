@@ -9,7 +9,7 @@ datasource db {
 
 model Product {
   id              Int       @id @default(autoincrement())
-  name            String    @unique
+  name            String
   price           Float
   description     String
   createdAt       DateTime  @default(now())
@@ -31,6 +31,10 @@ model Product {
   wishlists       Wishlist[]
   cartItems       CartItem[]
   reviews         Review[]
+
+  // Names only need to be unique inside one seller's store, so two
+  // sellers can both list e.g. "Cotton T-Shirt". URLs use the id.
+  @@unique([sellerId, name])
 }
 
 // One row per size/color combination for a product that has variants.

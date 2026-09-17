@@ -50,18 +50,27 @@ async function seedProducts() {
   console.log(`Seeding ${all.length} products...`);
 
   for (const product of all) {
-    await prisma.product.upsert({
+    // name is no longer globally unique (only per seller), so look it up first
+    const existing = await prisma.product.findFirst({
       where: { name: product.name },
-      update: {
-        isBestSeller: product.isBestSeller,
-        images: product.images,
-        price: product.price,
-        stock: product.stock,
-        description: product.description,
-        category: product.category,
-      },
-      create: product,
+      select: { id: true },
     });
+
+    if (existing) {
+      await prisma.product.update({
+        where: { id: existing.id },
+        data: {
+          isBestSeller: product.isBestSeller,
+          images: product.images,
+          price: product.price,
+          stock: product.stock,
+          description: product.description,
+          category: product.category,
+        },
+      });
+    } else {
+      await prisma.product.create({ data: product });
+    }
   }
   console.log("Products done.");
 }
@@ -236,7 +245,7 @@ async function seedReviews() {
   console.log(`Seeding ${sampleReviews.length} reviews...`);
 
   for (const r of sampleReviews) {
-    const product = await prisma.product.findUnique({
+    const product = await prisma.product.findFirst({
       where: { name: r.productName },
     });
     if (!product) {

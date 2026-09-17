@@ -181,12 +181,13 @@ router.post("/products", async (req, res) => {
   const data = parsed.data;
 
   try {
-    // Check unique name
-    const existing = await prisma.product.findUnique({
-      where: { name: data.name },
+    // Names only have to be unique within this seller's own store
+    const existing = await prisma.product.findFirst({
+      where: { sellerId, name: { equals: data.name, mode: "insensitive" } },
+      select: { id: true },
     });
     if (existing) {
-      return res.status(409).json({ error: "Product name already exists" });
+      return res.status(409).json({ error: "You already have a product with this name" });
     }
 
     const product = await prisma.product.create({
