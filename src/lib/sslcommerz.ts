@@ -84,9 +84,31 @@ export type ValidateSslResult = {
   tran_id?: string;
   val_id?: string;
   amount?: string;
+  currency?: string;
   card_type?: string;
   store_amount?: string;
 };
+
+// A VALID response only proves that *some* payment went through. Before
+// trusting it for an order, make sure it is this order's transaction and
+// that the full amount was paid in taka — otherwise the val_id of a cheap
+// payment could be replayed to mark an expensive order as paid.
+export function paymentMatchesOrder(
+  validation: ValidateSslResult,
+  order: { transactionId: string | null; total: number }
+) {
+  if (validation.status !== "VALID" && validation.status !== "VALIDATED") {
+    return false;
+  }
+  if (!order.transactionId || validation.tran_id !== order.transactionId) {
+    return false;
+  }
+  if (validation.currency && validation.currency !== "BDT") {
+    return false;
+  }
+  const paid = Number(validation.amount);
+  return Number.isFinite(paid) && Math.abs(paid - order.total) < 0.01;
+}
 
 export async function validateSslPayment(
   valId: string

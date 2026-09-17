@@ -5,8 +5,11 @@ import prisma from "./prisma.ts";
 import { requireAuth } from "./middleware/requireAuth.ts";
 import sellerRoutes from "./routes/seller.ts";
 import adminRoutes from "./routes/admin.ts";
-import { initiateSslPayment } from "./lib/sslcommerz.ts";
-import { validateSslPayment } from "./lib/sslcommerz.ts";
+import {
+  initiateSslPayment,
+  paymentMatchesOrder,
+  validateSslPayment,
+} from "./lib/sslcommerz.ts";
 import { parseId } from "./lib/params.ts";
 import { corsOptions } from "./config/cors.ts";
 import { unitPrice } from "./lib/pricing.ts";
@@ -944,9 +947,14 @@ app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
     }
 
     if (status === "VALID" || status === "VALIDATED") {
-      const validation = await validateSslPayment(valId);
-      if (validation.status === "VALID" || validation.status === "VALIDATED") {
+      const [order, validation] = await Promise.all([
+        prisma.order.findUnique({ where: { transactionId: tranId } }),
+        validateSslPayment(valId),
+      ]);
+      if (order && paymentMatchesOrder(validation, order)) {
         await markOrderPaid(tranId, valId);
+      } else {
+        console.warn("IPN ignored: validation does not match order", { tranId });
       }
     }
 
@@ -980,7 +988,7 @@ app.post("/api/payments/sslcommerz/confirm", requireAuth, async (req, res) => {
 
     if (val_id) {
       const validation = await validateSslPayment(val_id);
-      if (validation.status === "VALID" || validation.status === "VALIDATED") {
+      if (paymentMatchesOrder(validation, order)) {
         await markOrderPaid(tran_id, val_id);
         return res.json({ ok: true, orderId: order.id, paymentStatus: "PAID" });
       }
