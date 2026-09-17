@@ -3,6 +3,7 @@ import { z } from "zod";
 import prisma from "../prisma.ts";
 import { requireSeller } from "../middleware/requireSeller.ts";
 import { parseId } from "../lib/params.ts";
+import { MAX_DISCOUNT_PERCENT } from "../lib/pricing.ts";
 
 const router = Router();
 
@@ -145,7 +146,13 @@ const createProductSchema = z.object({
   images: z.array(z.string().url()).default([]),
   stock: z.coerce.number().int().min(0).default(0),
   hasVariants: z.boolean().default(false),
-  discountPercent: z.coerce.number().int().min(0).max(100).optional().nullable(),
+  discountPercent: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(MAX_DISCOUNT_PERCENT, `Discount cannot be more than ${MAX_DISCOUNT_PERCENT}%`)
+    .optional()
+    .nullable(),
   saleEndsAt: z.coerce.date().optional().nullable(),
   variants: z
     .array(
