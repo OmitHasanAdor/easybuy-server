@@ -9,7 +9,7 @@ datasource db {
 
 model Product {
   id              Int       @id @default(autoincrement())
-  name            String    @unique
+  name            String
   price           Float
   description     String
   createdAt       DateTime  @default(now())
@@ -31,6 +31,10 @@ model Product {
   wishlists       Wishlist[]
   cartItems       CartItem[]
   reviews         Review[]
+
+  // Names only need to be unique inside one seller's store, so two
+  // sellers can both list e.g. "Cotton T-Shirt". URLs use the id.
+  @@unique([sellerId, name])
 }
 
 // One row per size/color combination for a product that has variants.
@@ -45,8 +49,9 @@ model ProductVariant {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  product   Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
-  cartItems CartItem[]
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  cartItems  CartItem[]
+  orderItems OrderItem[]
 
   // prevents the same size+color combo being created twice for one product
   @@unique([productId, size, color])
@@ -203,8 +208,14 @@ model Order {
 // Payment fields (new)
   paymentMethod  String?   // COD | SSLCOMMERZ
   paymentStatus  String    @default("UNPAID") // UNPAID | PAID | FAILED
-  transactionId  String?
+  transactionId  String?   @unique
   paidAt         DateTime?
+
+  // true while the ordered quantities are taken out of product stock.
+  // COD orders deduct at checkout, online orders once payment is verified;
+  // cancelling puts the stock back and flips this to false, so it can
+  // never be restored twice.
+  stockDeducted  Boolean   @default(false)
 
   // Optional shipping snapshot (address থেকে)
   shippingName    String?
@@ -220,11 +231,13 @@ model OrderItem {
   id        Int   @id @default(autoincrement())
   orderId   Int
   productId Int
+  variantId Int? // which size/color was bought, so its stock can be adjusted
   quantity  Int
   price     Float
 
-  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  order   Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
 }
 
 model Address {

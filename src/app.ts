@@ -1,15 +1,24 @@
-import express from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
 import { z } from "zod";
 import prisma from "./prisma.ts";
 import { requireAuth } from "./middleware/requireAuth.ts";
 import sellerRoutes from "./routes/seller.ts";
 import adminRoutes from "./routes/admin.ts";
-import { initiateSslPayment } from "./lib/sslcommerz.ts";
-import { validateSslPayment } from "./lib/sslcommerz.ts";
+import {
+  initiateSslPayment,
+  paymentMatchesOrder,
+  validateSslPayment,
+  verifyIpnSignature,
+} from "./lib/sslcommerz.ts";
+import { parseId } from "./lib/params.ts";
+import { corsOptions } from "./config/cors.ts";
+import { unitPrice } from "./lib/pricing.ts";
+import { deductStock, OutOfStockError, releaseOrderStock } from "./lib/orders.ts";
 
 const app = express();
-app.use(cors());
+app.disable("x-powered-by");
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // SSLCommerz IPN
 
@@ -103,9 +112,13 @@ app.get("/api/categories", async (req, res) => {
 
 // product details, including variants and reviews
 app.get("/api/products/:id", async (req, res) => {
+  const id = parseId(req.params.id);
+  if (id === null) {
+    return res.status(404).json({ message: "Product not found" });
+  }
   try {
     const product = await prisma.product.findUnique({
-      where: { id: Number(req.params.id) },
+      where: { id },
       include: {
         variants: true,
         reviews: {
@@ -126,8 +139,11 @@ app.get("/api/products/:id", async (req, res) => {
 
 // related products
 app.get("/api/products/:id/related", async (req, res) => {
+  const productId = parseId(req.params.id);
+  if (productId === null) {
+    return res.status(404).json({ message: "Product not found" });
+  }
   try {
-    const productId = Number(req.params.id);
     const current = await prisma.product.findUnique({ where: { id: productId } });
     if (!current) {
       return res.status(404).json({ message: "Product not found" });
@@ -148,16 +164,14 @@ app.get("/api/products/:id/related", async (req, res) => {
   }
 });
 
-//orders routes
-app.get("/api/orders", async (req, res) => {
-  const { userId } = req.query;
-  if (!userId || typeof userId !== "string") {
-    return res.status(400).json({ error: "User ID is required" });
-  }
+// orders of the signed-in user. The user always comes from the session,
+// never from the query string; admins list everyone's orders through
+// /api/admin/orders instead.
+app.get("/api/orders", requireAuth, async (req, res) => {
   try {
     const orders = await prisma.order.findMany({
       where: {
-        userId,
+        userId: req.userId!,
       },
       include: {
         items: {
@@ -179,28 +193,91 @@ app.get("/api/orders", async (req, res) => {
   }
 });
 
-// user role route
-app.get("/user-role", async (req, res) => {
-  const { email } = req.query;
-  if (!email || typeof email !== "string") {
-    return res.status(400).json({ error: "Email is required" });
+// Buyers may cancel their own order while it is still PENDING. Orders that
+// were already paid online need a refund, so those go through support.
+app.post("/api/orders/:id/cancel", requireAuth, async (req, res) => {
+  const id = parseId(req.params.id);
+  if (id === null) {
+    return res.status(400).json({ error: "Invalid order ID" });
   }
+
+  try {
+    const order = await prisma.order.findFirst({
+      where: { id, userId: req.userId! },
+      select: { id: true, status: true, paymentStatus: true },
+    });
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    if (order.status !== "PENDING") {
+      return res.status(400).json({ error: "Only pending orders can be cancelled" });
+    }
+    if (order.paymentStatus === "PAID") {
+      return res.status(400).json({
+        error: "This order is already paid. Please contact support to cancel it.",
+      });
+    }
+
+    const cancelled = await prisma.$transaction(async (tx) => {
+      const moved = await tx.order.updateMany({
+        where: { id, status: "PENDING", paymentStatus: { not: "PAID" } },
+        data: { status: "CANCELLED" },
+      });
+      if (moved.count === 0) return false;
+      await releaseOrderStock(tx, id);
+      return true;
+    });
+
+    if (!cancelled) {
+      return res.status(409).json({ error: "The order was just updated, please refresh" });
+    }
+    res.json({ ok: true, orderId: id, status: "CANCELLED" });
+  } catch (error) {
+    console.error("Error cancelling order:", error);
+    res.status(500).json({ error: "Failed to cancel order" });
+  }
+});
+
+const publicUserSelect = {
+  id: true,
+  name: true,
+  email: true,
+  role: true,
+  status: true,
+} as const;
+
+// the signed-in user's own profile and role
+app.get("/api/me", requireAuth, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
-      where: { email },
-      select: {
-        name: true,
-        email: true,
-        role: true,
-        status: true,
-      },
+      where: { id: req.userId! },
+      select: publicUserSelect,
     });
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
-    // block banned/inactive accounts from getting a role back
-    if (user.status !== "active") {
-      return res.status(403).json({ error: "Account is not active" });
+    return res.status(200).json(user);
+  } catch (error) {
+    console.error("Error fetching current user:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// user role route (kept for older clients). Returns the caller's own role;
+// only admins may look up another account by email.
+app.get("/user-role", requireAuth, async (req, res) => {
+  const email = typeof req.query.email === "string" ? req.query.email.trim() : "";
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: email && req.userRole === "admin" ? { email } : { id: req.userId! },
+      select: publicUserSelect,
+    });
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (email && req.userRole !== "admin" && user.email.toLowerCase() !== email.toLowerCase()) {
+      return res.status(403).json({ error: "You can only look up your own account" });
     }
     return res.status(200).json(user);
   } catch (error) {
@@ -237,6 +314,14 @@ app.post("/api/wishlist", requireAuth, async (req, res) => {
   const { productId } = parsed.data;
   const userId = req.userId!;
   try {
+    const product = await prisma.product.findUnique({
+      where: { id: productId },
+      select: { id: true },
+    });
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
     const entry = await prisma.wishlist.upsert({
       where: { userId_productId: { userId, productId } },
       update: {},
@@ -281,8 +366,8 @@ app.get("/api/reviews/my", requireAuth, async (req, res) => {
 
 // remove a product from a user's wishlist
 app.delete("/api/wishlist/:productId", requireAuth, async (req, res) => {
-  const productId = Number(req.params.productId);
-  if (!Number.isFinite(productId)) {
+  const productId = parseId(req.params.productId);
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
   try {
@@ -309,6 +394,14 @@ app.get("/api/cart", requireAuth, async (req, res) => {
   }
 });
 
+function stockErrorMessage(stock: number, alreadyInCart: number) {
+  if (stock <= 0) return "This item is out of stock";
+  if (alreadyInCart > 0) {
+    return `Only ${stock} in stock and you already have ${alreadyInCart} in your cart`;
+  }
+  return `Only ${stock} in stock`;
+}
+
 const addCartBodySchema = z.object({
   productId: z.coerce.number().int().positive(),
   variantId: z.coerce.number().int().positive().nullable().optional(),
@@ -326,27 +419,38 @@ app.post("/api/cart", requireAuth, async (req, res) => {
   const userId = req.userId!;
 
   try {
+    const existing = await prisma.cartItem.findFirst({
+      where: { userId, productId, variantId },
+    });
+    // what the cart row would hold after this request
+    const requestedTotal = (existing?.quantity ?? 0) + quantity;
+
     if (variantId) {
       const variant = await prisma.productVariant.findUnique({ where: { id: variantId } });
       if (!variant || variant.productId !== productId) {
         return res.status(400).json({ error: "Variant does not belong to this product" });
       }
-      if (variant.stock < quantity) {
-        return res.status(409).json({ error: "Not enough stock for this variant" });
+      if (variant.stock < requestedTotal) {
+        return res.status(409).json({
+          error: stockErrorMessage(variant.stock, existing?.quantity ?? 0),
+          available: variant.stock,
+        });
       }
     } else {
       const product = await prisma.product.findUnique({ where: { id: productId } });
       if (!product) {
         return res.status(404).json({ error: "Product not found" });
       }
-      if (product.stock < quantity) {
-        return res.status(409).json({ error: "Not enough stock" });
+      if (product.hasVariants) {
+        return res.status(400).json({ error: "Please choose a size or color first" });
+      }
+      if (product.stock < requestedTotal) {
+        return res.status(409).json({
+          error: stockErrorMessage(product.stock, existing?.quantity ?? 0),
+          available: product.stock,
+        });
       }
     }
-
-    const existing = await prisma.cartItem.findFirst({
-      where: { userId, productId, variantId },
-    });
 
     const item = existing
       ? await prisma.cartItem.update({
@@ -372,18 +476,31 @@ const updateCartBodySchema = z.object({
 
 // update quantity of one cart row 
 app.patch("/api/cart/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parseId(req.params.id);
   const parsed = updateCartBodySchema.safeParse(req.body);
-  if (!Number.isFinite(id)) {
+  if (id === null) {
     return res.status(400).json({ error: "Invalid cart item ID" });
   }
   if (!parsed.success) {
     return res.status(400).json({ error: "Invalid body", details: parsed.error.issues });
   }
   try {
-    const existing = await prisma.cartItem.findUnique({ where: { id } });
+    const existing = await prisma.cartItem.findUnique({
+      where: { id },
+      include: {
+        product: { select: { stock: true } },
+        variant: { select: { stock: true } },
+      },
+    });
     if (!existing || existing.userId !== req.userId) {
       return res.status(404).json({ error: "Cart item not found" });
+    }
+    const stock = existing.variant ? existing.variant.stock : existing.product.stock;
+    if (parsed.data.quantity > stock) {
+      return res.status(409).json({
+        error: stockErrorMessage(stock, 0),
+        available: stock,
+      });
     }
     const item = await prisma.cartItem.update({
       where: { id },
@@ -399,8 +516,8 @@ app.patch("/api/cart/:id", requireAuth, async (req, res) => {
 
 // remove one cart row 
 app.delete("/api/cart/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid cart item ID" });
   }
   try {
@@ -418,8 +535,8 @@ app.delete("/api/cart/:id", requireAuth, async (req, res) => {
 
 // reviews routes 
 app.get("/api/products/:id/reviews", async (req, res) => {
-  const productId = Number(req.params.id);
-  if (!Number.isFinite(productId)) {
+  const productId = parseId(req.params.id);
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
   try {
@@ -443,8 +560,8 @@ const reviewBodySchema = z.object({
 
 // create or update review
 app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
-  const productId = Number(req.params.id);
-  if (!Number.isFinite(productId)) {
+  const productId = parseId(req.params.id);
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
   const parsed = reviewBodySchema.safeParse(req.body);
@@ -455,14 +572,23 @@ app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
   const userId = req.userId!;
 
   try {
+    // Only buyers who actually received the product may review it,
+    // which keeps ratings from being padded with fake reviews.
     const purchased = await prisma.orderItem.findFirst({
-      where: { productId, order: { userId } },
+      where: { productId, order: { userId, status: "DELIVERED" } },
+      select: { id: true },
     });
+    if (!purchased) {
+      return res.status(403).json({
+        error: "You can review this product after your order has been delivered",
+      });
+    }
 
+    // one review per user per product: posting again edits the existing one
     const review = await prisma.review.upsert({
       where: { userId_productId: { userId, productId } },
-      update: { rating, title, comment, verifiedPurchase: !!purchased },
-      create: { userId, productId, rating, title, comment, verifiedPurchase: !!purchased },
+      update: { rating, title, comment, verifiedPurchase: true },
+      create: { userId, productId, rating, title, comment, verifiedPurchase: true },
       include: { user: { select: { name: true } } },
     });
     res.status(201).json(review);
@@ -472,10 +598,28 @@ app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
   }
 });
 
+// whether the signed-in user may review a product
+app.get("/api/products/:id/reviews/eligibility", requireAuth, async (req, res) => {
+  const productId = parseId(req.params.id);
+  if (productId === null) {
+    return res.status(400).json({ error: "Invalid product ID" });
+  }
+  try {
+    const purchased = await prisma.orderItem.findFirst({
+      where: { productId, order: { userId: req.userId!, status: "DELIVERED" } },
+      select: { id: true },
+    });
+    res.json({ canReview: !!purchased });
+  } catch (error) {
+    console.error("Error checking review eligibility:", error);
+    res.status(500).json({ error: "Failed to check review eligibility" });
+  }
+});
+
 // delete your own review
 app.delete("/api/products/:id/reviews", requireAuth, async (req, res) => {
-  const productId = Number(req.params.id);
-  if (!Number.isFinite(productId)) {
+  const productId = parseId(req.params.id);
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
   try {
@@ -524,25 +668,29 @@ app.post("/api/addresses", requireAuth, async (req, res) => {
   const data = parsed.data;
 
   try {
-    if (data.isDefault) {
-      await prisma.address.updateMany({
-        where: { userId },
-        data: { isDefault: false },
-      });
-    }
+    // unset the old default and create the new one together, so a failure
+    // can't leave the user without any default address
+    const address = await prisma.$transaction(async (tx) => {
+      if (data.isDefault) {
+        await tx.address.updateMany({
+          where: { userId },
+          data: { isDefault: false },
+        });
+      }
 
-    const address = await prisma.address.create({
-      data: {
-        userId,
-        label: data.label ?? null,
-        fullName: data.fullName,
-        phone: data.phone,
-        addressLine1: data.addressLine1,
-        addressLine2: data.addressLine2 ?? null,
-        city: data.city,
-        postalCode: data.postalCode ?? null,
-        isDefault: data.isDefault ?? false,
-      },
+      return tx.address.create({
+        data: {
+          userId,
+          label: data.label ?? null,
+          fullName: data.fullName,
+          phone: data.phone,
+          addressLine1: data.addressLine1,
+          addressLine2: data.addressLine2 ?? null,
+          city: data.city,
+          postalCode: data.postalCode ?? null,
+          isDefault: data.isDefault ?? false,
+        },
+      });
     });
 
     res.status(201).json(address);
@@ -554,12 +702,17 @@ app.post("/api/addresses", requireAuth, async (req, res) => {
 
 // Update
 app.patch("/api/addresses/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid address ID" });
   }
 
-  const parsed = addressSchema.partial().safeParse(req.body);
+  // .partial() keeps .default(false) on isDefault, which silently removed the
+  // default flag whenever any other field was edited; drop that default here
+  const parsed = addressSchema
+    .extend({ isDefault: z.boolean().optional() })
+    .partial()
+    .safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: "Invalid data", details: parsed.error.issues });
   }
@@ -574,16 +727,18 @@ app.patch("/api/addresses/:id", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "Address not found" });
     }
 
-    if (parsed.data.isDefault === true) {
-      await prisma.address.updateMany({
-        where: { userId },
-        data: { isDefault: false },
-      });
-    }
+    const updated = await prisma.$transaction(async (tx) => {
+      if (parsed.data.isDefault === true) {
+        await tx.address.updateMany({
+          where: { userId, id: { not: id } },
+          data: { isDefault: false },
+        });
+      }
 
-    const updated = await prisma.address.update({
-      where: { id },
-      data: parsed.data,
+      return tx.address.update({
+        where: { id },
+        data: parsed.data,
+      });
     });
 
     res.json(updated);
@@ -595,8 +750,8 @@ app.patch("/api/addresses/:id", requireAuth, async (req, res) => {
 
 // Delete
 app.delete("/api/addresses/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid address ID" });
   }
 
@@ -672,18 +827,25 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Shipping address is required" });
     }
 
-    // Stock + total
-    let total = 0;
+    // Stock check
     for (const item of cartItems) {
-      const price = item.variant?.price != null ? item.variant.price : item.product.price;
       const stock = item.variant ? item.variant.stock : item.product.stock;
       if (stock < item.quantity) {
         return res.status(409).json({
           error: `Not enough stock for "${item.product.name}"`,
         });
       }
-      total += price * item.quantity;
     }
+
+    // Prices are always worked out here from the product row, including any
+    // running sale, so the buyer pays what the storefront showed them.
+    const lineItems = cartItems.map((item) => ({
+      productId: item.productId,
+      variantId: item.variantId,
+      quantity: item.quantity,
+      price: unitPrice(item.product, item.variant),
+    }));
+    const total = lineItems.reduce((sum, line) => sum + line.price * line.quantity, 0);
 
     const productName = cartItems
       .map((i) => i.product.name)
@@ -693,6 +855,10 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
     // ── COD ──────────────────────────────────────────
     if (paymentMethod === "COD") {
       const order = await prisma.$transaction(async (tx) => {
+        // throws OutOfStockError (and rolls everything back) if another
+        // buyer got the last units after the check above
+        await deductStock(tx, lineItems);
+
         const newOrder = await tx.order.create({
           data: {
             userId,
@@ -700,38 +866,19 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
             status: "PENDING",
             paymentMethod: "COD",
             paymentStatus: "UNPAID",
+            stockDeducted: true,
             shippingName,
             shippingPhone,
             shippingAddress,
             shippingCity,
-            items: {
-              create: cartItems.map((item) => ({
-                productId: item.productId,
-                quantity: item.quantity,
-                price:
-                  item.variant?.price != null
-                    ? item.variant.price
-                    : item.product.price,
-              })),
-            },
+            items: { create: lineItems },
           },
         });
 
-        for (const item of cartItems) {
-          if (item.variantId) {
-            await tx.productVariant.update({
-              where: { id: item.variantId },
-              data: { stock: { decrement: item.quantity } },
-            });
-          } else {
-            await tx.product.update({
-              where: { id: item.productId },
-              data: { stock: { decrement: item.quantity } },
-            });
-          }
-        }
-
-        await tx.cartItem.deleteMany({ where: { userId } });
+        // only the rows that went into this order
+        await tx.cartItem.deleteMany({
+          where: { id: { in: cartItems.map((item) => item.id) } },
+        });
         return newOrder;
       });
 
@@ -759,21 +906,11 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
           shippingPhone,
           shippingAddress,
           shippingCity,
-          items: {
-            create: cartItems.map((item) => ({
-              productId: item.productId,
-              quantity: item.quantity,
-              price:
-                item.variant?.price != null
-                  ? item.variant.price
-                  : item.product.price,
-            })),
-          },
+          items: { create: lineItems },
         },
       });
 
-      // Stock: pay হলে কমাবে — অথবা এখন reserve করতে চাইলে এখানে decrement
-      // Assignment: pay success-এ stock কমাও (IPN/validate এ)
+      // Stock is taken once the payment is verified (see markOrderPaid)
       return newOrder;
     });
 
@@ -782,28 +919,40 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
       process.env.SERVER_PUBLIC_URL ||
       `http://localhost:${process.env.PORT || 5000}`;
 
-    const ssl = await initiateSslPayment({
-      totalAmount: total,
-      tranId,
-      productName,
-      cusName: shippingName,
-      cusEmail: user.email,
-      cusPhone: shippingPhone,
-      cusAdd1: shippingAddress,
-      cusCity: shippingCity,
-      successUrl: `${frontend}/checkout/success?tran_id=${tranId}&orderId=${order.id}`,
-      failUrl: `${frontend}/checkout/fail?tran_id=${tranId}&orderId=${order.id}`,
-      cancelUrl: `${frontend}/checkout/cancel?tran_id=${tranId}&orderId=${order.id}`,
-      ipnUrl: `${serverPublic}/api/payments/sslcommerz/ipn`,
-      valueA: String(order.id),
-      valueB: tranId,
-    });
-
-    if (ssl.status !== "SUCCESS" || !ssl.GatewayPageURL) {
-      await prisma.order.update({
+    const closeUnpaidOrder = () =>
+      prisma.order.update({
         where: { id: order.id },
         data: { paymentStatus: "FAILED", status: "CANCELLED" },
       });
+
+    let ssl: Awaited<ReturnType<typeof initiateSslPayment>>;
+    try {
+      ssl = await initiateSslPayment({
+        totalAmount: total,
+        tranId,
+        productName,
+        cusName: shippingName,
+        cusEmail: user.email,
+        cusPhone: shippingPhone,
+        cusAdd1: shippingAddress,
+        cusCity: shippingCity,
+        successUrl: `${frontend}/checkout/success?tran_id=${tranId}&orderId=${order.id}`,
+        failUrl: `${frontend}/checkout/fail?tran_id=${tranId}&orderId=${order.id}`,
+        cancelUrl: `${frontend}/checkout/cancel?tran_id=${tranId}&orderId=${order.id}`,
+        ipnUrl: `${serverPublic}/api/payments/sslcommerz/ipn`,
+        valueA: String(order.id),
+        valueB: tranId,
+      });
+    } catch (error) {
+      // gateway unreachable or misconfigured: don't leave a dangling
+      // PENDING order behind that an admin might ship unpaid
+      console.error("SSLCommerz init error:", error);
+      await closeUnpaidOrder();
+      return res.status(502).json({ error: "Payment gateway is unavailable, please try again" });
+    }
+
+    if (ssl.status !== "SUCCESS" || !ssl.GatewayPageURL) {
+      await closeUnpaidOrder();
       return res.status(502).json({
         error: ssl.failedreason || "Payment gateway rejected the request",
       });
@@ -816,40 +965,64 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
       url: ssl.GatewayPageURL,
     });
   } catch (error) {
+    if (error instanceof OutOfStockError) {
+      return res.status(409).json({ error: "Some items in your cart just sold out" });
+    }
     console.error("Checkout error:", error);
     return res.status(500).json({ error: "Failed to place order" });
   }
 });
-async function markOrderPaid(tranId: string, valId?: string) {
-  const order = await prisma.order.findFirst({
-    where: { transactionId: tranId },
-    include: { items: true },
-  });
-  if (!order) return null;
-  if (order.paymentStatus === "PAID") return order; // idempotent
-
+// Marks an online order as paid and takes its items out of stock.
+// The IPN and the success page may both call this for the same payment,
+// so the UNPAID -> PAID switch is a single conditional update: only the
+// call that actually flips it goes on to touch stock and the cart.
+async function markOrderPaid(tranId: string) {
   return prisma.$transaction(async (tx) => {
-    const updated = await tx.order.update({
-      where: { id: order.id },
-      data: {
-        paymentStatus: "PAID",
-        status: "PENDING", // or PROCESSING
-        paidAt: new Date(),
+    const claimed = await tx.order.updateMany({
+      where: { transactionId: tranId, paymentStatus: { not: "PAID" } },
+      data: { paymentStatus: "PAID", paidAt: new Date() },
+    });
+
+    const order = await tx.order.findUnique({
+      where: { transactionId: tranId },
+      include: { items: true },
+    });
+    if (!order || claimed.count === 0) return order;
+
+    if (order.status === "CANCELLED") {
+      // Money arrived for an order that was already cancelled. Keep it
+      // cancelled and leave stock alone so an admin can refund it.
+      console.warn("Payment received for a cancelled order", { orderId: order.id });
+      return order;
+    }
+
+    try {
+      await deductStock(tx, order.items);
+      await tx.order.update({ where: { id: order.id }, data: { stockDeducted: true } });
+    } catch (error) {
+      if (!(error instanceof OutOfStockError)) throw error;
+      // The buyer has already paid, so the payment stays recorded. Stock ran
+      // out while they were on the gateway page; an admin has to restock or
+      // cancel and refund.
+      console.warn("Paid order could not be taken from stock", { orderId: order.id });
+    }
+
+    // Remove what was bought from the cart, keep anything added since
+    await tx.cartItem.deleteMany({
+      where: {
+        userId: order.userId,
+        OR: order.items.map((item) => ({
+          productId: item.productId,
+          variantId: item.variantId,
+        })),
       },
     });
 
-    // Reduce stock + clear cart (SSL path)
-    for (const item of order.items) {
-      await tx.product.update({
-        where: { id: item.productId },
-        data: { stock: { decrement: item.quantity } },
-      });
-    }
-    await tx.cartItem.deleteMany({ where: { userId: order.userId } });
-
-    return updated;
+    return order;
   });
 }
+
+const UNSUCCESSFUL_PAYMENT_STATUSES = new Set(["FAILED", "CANCELLED", "EXPIRED", "UNATTEMPTED"]);
 
 // IPN (webhook from SSLCommerz)
 app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
@@ -859,14 +1032,30 @@ app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
     const valId = body.val_id as string | undefined;
     const status = body.status as string | undefined;
 
-    if (!tranId || !valId) {
+    if (!tranId) {
       return res.status(400).send("Invalid IPN");
     }
 
-    if (status === "VALID" || status === "VALIDATED") {
-      const validation = await validateSslPayment(valId);
-      if (validation.status === "VALID" || validation.status === "VALIDATED") {
-        await markOrderPaid(tranId, valId);
+    if ((status === "VALID" || status === "VALIDATED") && valId) {
+      const [order, validation] = await Promise.all([
+        prisma.order.findUnique({ where: { transactionId: tranId } }),
+        validateSslPayment(valId),
+      ]);
+      if (order && paymentMatchesOrder(validation, order)) {
+        await markOrderPaid(tranId);
+      } else {
+        console.warn("IPN ignored: validation does not match order", { tranId });
+      }
+    } else if (status && UNSUCCESSFUL_PAYMENT_STATUSES.has(status)) {
+      if (verifyIpnSignature(body)) {
+        // close the unpaid order so it doesn't sit in PENDING forever;
+        // no stock was taken for it yet
+        await prisma.order.updateMany({
+          where: { transactionId: tranId, status: "PENDING", paymentStatus: { not: "PAID" } },
+          data: { status: "CANCELLED", paymentStatus: "FAILED" },
+        });
+      } else {
+        console.warn("IPN ignored: invalid signature", { tranId, status });
       }
     }
 
@@ -880,10 +1069,10 @@ app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
 // Success page backup validation
 app.post("/api/payments/sslcommerz/confirm", requireAuth, async (req, res) => {
   try {
-    const { tran_id, val_id } = req.body as {
-      tran_id?: string;
-      val_id?: string;
-    };
+    // Express 5 leaves req.body undefined when no JSON body was sent
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const tran_id = typeof body.tran_id === "string" ? body.tran_id : undefined;
+    const val_id = typeof body.val_id === "string" ? body.val_id : undefined;
 
     if (!tran_id) {
       return res.status(400).json({ error: "tran_id required" });
@@ -900,8 +1089,8 @@ app.post("/api/payments/sslcommerz/confirm", requireAuth, async (req, res) => {
 
     if (val_id) {
       const validation = await validateSslPayment(val_id);
-      if (validation.status === "VALID" || validation.status === "VALIDATED") {
-        await markOrderPaid(tran_id, val_id);
+      if (paymentMatchesOrder(validation, order)) {
+        await markOrderPaid(tran_id);
         return res.json({ ok: true, orderId: order.id, paymentStatus: "PAID" });
       }
     }
@@ -920,5 +1109,27 @@ app.post("/api/payments/sslcommerz/confirm", requireAuth, async (req, res) => {
 
 app.use("/api/seller", sellerRoutes);
 app.use("/api/admin", adminRoutes);
+
+// Unknown routes get JSON like the rest of the API instead of Express' HTML page
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
+});
+
+// Last-resort error handler: malformed JSON bodies become a 400, anything
+// else a generic 500 without leaking stack traces to the client.
+app.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    return next(error);
+  }
+  const status = (error as { status?: number })?.status;
+  if (status === 400 || (error as { type?: string })?.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "Invalid request body" });
+  }
+  if (status === 413) {
+    return res.status(413).json({ error: "Request body is too large" });
+  }
+  console.error("Unhandled error:", error);
+  res.status(500).json({ error: "Internal server error" });
+});
 
 export default app;
