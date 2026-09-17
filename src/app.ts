@@ -520,20 +520,47 @@ app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
   const userId = req.userId!;
 
   try {
+    // Only buyers who actually received the product may review it,
+    // which keeps ratings from being padded with fake reviews.
     const purchased = await prisma.orderItem.findFirst({
-      where: { productId, order: { userId } },
+      where: { productId, order: { userId, status: "DELIVERED" } },
+      select: { id: true },
     });
+    if (!purchased) {
+      return res.status(403).json({
+        error: "You can review this product after your order has been delivered",
+      });
+    }
 
+    // one review per user per product: posting again edits the existing one
     const review = await prisma.review.upsert({
       where: { userId_productId: { userId, productId } },
-      update: { rating, title, comment, verifiedPurchase: !!purchased },
-      create: { userId, productId, rating, title, comment, verifiedPurchase: !!purchased },
+      update: { rating, title, comment, verifiedPurchase: true },
+      create: { userId, productId, rating, title, comment, verifiedPurchase: true },
       include: { user: { select: { name: true } } },
     });
     res.status(201).json(review);
   } catch (error) {
     console.error("Error saving review:", error);
     res.status(500).json({ error: "Failed to save review" });
+  }
+});
+
+// whether the signed-in user may review a product
+app.get("/api/products/:id/reviews/eligibility", requireAuth, async (req, res) => {
+  const productId = parseId(req.params.id);
+  if (productId === null) {
+    return res.status(400).json({ error: "Invalid product ID" });
+  }
+  try {
+    const purchased = await prisma.orderItem.findFirst({
+      where: { productId, order: { userId: req.userId!, status: "DELIVERED" } },
+      select: { id: true },
+    });
+    res.json({ canReview: !!purchased });
+  } catch (error) {
+    console.error("Error checking review eligibility:", error);
+    res.status(500).json({ error: "Failed to check review eligibility" });
   }
 });
 
