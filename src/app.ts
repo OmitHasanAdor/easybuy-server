@@ -667,25 +667,29 @@ app.post("/api/addresses", requireAuth, async (req, res) => {
   const data = parsed.data;
 
   try {
-    if (data.isDefault) {
-      await prisma.address.updateMany({
-        where: { userId },
-        data: { isDefault: false },
-      });
-    }
+    // unset the old default and create the new one together, so a failure
+    // can't leave the user without any default address
+    const address = await prisma.$transaction(async (tx) => {
+      if (data.isDefault) {
+        await tx.address.updateMany({
+          where: { userId },
+          data: { isDefault: false },
+        });
+      }
 
-    const address = await prisma.address.create({
-      data: {
-        userId,
-        label: data.label ?? null,
-        fullName: data.fullName,
-        phone: data.phone,
-        addressLine1: data.addressLine1,
-        addressLine2: data.addressLine2 ?? null,
-        city: data.city,
-        postalCode: data.postalCode ?? null,
-        isDefault: data.isDefault ?? false,
-      },
+      return tx.address.create({
+        data: {
+          userId,
+          label: data.label ?? null,
+          fullName: data.fullName,
+          phone: data.phone,
+          addressLine1: data.addressLine1,
+          addressLine2: data.addressLine2 ?? null,
+          city: data.city,
+          postalCode: data.postalCode ?? null,
+          isDefault: data.isDefault ?? false,
+        },
+      });
     });
 
     res.status(201).json(address);
@@ -717,16 +721,18 @@ app.patch("/api/addresses/:id", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "Address not found" });
     }
 
-    if (parsed.data.isDefault === true) {
-      await prisma.address.updateMany({
-        where: { userId },
-        data: { isDefault: false },
-      });
-    }
+    const updated = await prisma.$transaction(async (tx) => {
+      if (parsed.data.isDefault === true) {
+        await tx.address.updateMany({
+          where: { userId, id: { not: id } },
+          data: { isDefault: false },
+        });
+      }
 
-    const updated = await prisma.address.update({
-      where: { id },
-      data: parsed.data,
+      return tx.address.update({
+        where: { id },
+        data: parsed.data,
+      });
     });
 
     res.json(updated);
