@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import prisma from "../prisma.ts";
 import { requireAdmin } from "../middleware/requireAdmin.ts";
+import { parseId } from "../lib/params.ts";
 
 const router = Router();
 router.use(requireAdmin);
@@ -227,8 +228,8 @@ router.get("/products", async (req, res) => {
 });
 
 router.delete("/products/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
 
@@ -280,8 +281,8 @@ const orderStatusSchema = z.object({
 });
 
 router.patch("/orders/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid order ID" });
   }
 
@@ -334,8 +335,8 @@ router.get("/reviews", async (_req, res) => {
 });
 
 router.delete("/reviews/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid review ID" });
   }
 

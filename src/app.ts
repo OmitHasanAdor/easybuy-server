@@ -289,8 +289,8 @@ app.get("/api/reviews/my", requireAuth, async (req, res) => {
 
 // remove a product from a user's wishlist
 app.delete("/api/wishlist/:productId", requireAuth, async (req, res) => {
-  const productId = Number(req.params.productId);
-  if (!Number.isFinite(productId)) {
+  const productId = parseId(req.params.productId);
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
   try {
@@ -380,9 +380,9 @@ const updateCartBodySchema = z.object({
 
 // update quantity of one cart row 
 app.patch("/api/cart/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parseId(req.params.id);
   const parsed = updateCartBodySchema.safeParse(req.body);
-  if (!Number.isFinite(id)) {
+  if (id === null) {
     return res.status(400).json({ error: "Invalid cart item ID" });
   }
   if (!parsed.success) {
@@ -407,8 +407,8 @@ app.patch("/api/cart/:id", requireAuth, async (req, res) => {
 
 // remove one cart row 
 app.delete("/api/cart/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid cart item ID" });
   }
   try {
@@ -426,8 +426,8 @@ app.delete("/api/cart/:id", requireAuth, async (req, res) => {
 
 // reviews routes 
 app.get("/api/products/:id/reviews", async (req, res) => {
-  const productId = Number(req.params.id);
-  if (!Number.isFinite(productId)) {
+  const productId = parseId(req.params.id);
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
   try {
@@ -451,8 +451,8 @@ const reviewBodySchema = z.object({
 
 // create or update review
 app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
-  const productId = Number(req.params.id);
-  if (!Number.isFinite(productId)) {
+  const productId = parseId(req.params.id);
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
   const parsed = reviewBodySchema.safeParse(req.body);
@@ -482,8 +482,8 @@ app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
 
 // delete your own review
 app.delete("/api/products/:id/reviews", requireAuth, async (req, res) => {
-  const productId = Number(req.params.id);
-  if (!Number.isFinite(productId)) {
+  const productId = parseId(req.params.id);
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
   try {
@@ -562,8 +562,8 @@ app.post("/api/addresses", requireAuth, async (req, res) => {
 
 // Update
 app.patch("/api/addresses/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid address ID" });
   }
 
@@ -603,8 +603,8 @@ app.patch("/api/addresses/:id", requireAuth, async (req, res) => {
 
 // Delete
 app.delete("/api/addresses/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid address ID" });
   }
 

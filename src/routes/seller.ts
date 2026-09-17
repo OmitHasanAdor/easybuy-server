@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import prisma from "../prisma.ts";
 import { requireSeller } from "../middleware/requireSeller.ts";
+import { parseId } from "../lib/params.ts";
 
 const router = Router();
 
@@ -220,9 +221,9 @@ router.post("/products", async (req, res) => {
 // ======================
 router.delete("/products/:id", async (req, res) => {
   const sellerId = req.userId!;
-  const productId = Number(req.params.id);
+  const productId = parseId(req.params.id);
 
-  if (!Number.isFinite(productId)) {
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
 
@@ -276,10 +277,10 @@ router.get("/inventory", async (req, res) => {
 // Update product stock
 router.patch("/products/:id/stock", async (req, res) => {
   const sellerId = req.userId!;
-  const productId = Number(req.params.id);
+  const productId = parseId(req.params.id);
   const { stock } = req.body;
 
-  if (!Number.isFinite(productId)) {
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
 
@@ -312,10 +313,10 @@ router.patch("/products/:id/stock", async (req, res) => {
 // Update variant stock
 router.patch("/variants/:id/stock", async (req, res) => {
   const sellerId = req.userId!;
-  const variantId = Number(req.params.id);
+  const variantId = parseId(req.params.id);
   const { stock } = req.body;
 
-  if (!Number.isFinite(variantId)) {
+  if (variantId === null) {
     return res.status(400).json({ error: "Invalid variant ID" });
   }
 
