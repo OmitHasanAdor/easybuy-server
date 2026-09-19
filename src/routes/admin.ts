@@ -2,6 +2,14 @@ import { Router } from "express";
 import { z } from "zod";
 import prisma from "../prisma.ts";
 import { requireAdmin } from "../middleware/requireAdmin.ts";
+import { parseId } from "../lib/params.ts";
+import {
+  canTransition,
+  ORDER_STATUSES,
+  ORDER_TRANSITIONS,
+  releaseOrderStock,
+  type OrderStatus,
+} from "../lib/orders.ts";
 
 const router = Router();
 router.use(requireAdmin);
@@ -171,12 +179,16 @@ router.patch("/users/:id", async (req, res) => {
       return res.status(403).json({ error: "Cannot modify admin accounts" });
     }
 
-    const updated = await prisma.user.update({
+    const blocking = parsed.data.banned === true || parsed.data.status === "inactive";
+
+    const updateUser = prisma.user.update({
       where: { id: userId },
       data: {
         ...(parsed.data.status !== undefined && { status: parsed.data.status }),
         ...(parsed.data.banned !== undefined && { banned: parsed.data.banned }),
         ...(parsed.data.banReason !== undefined && { banReason: parsed.data.banReason }),
+        // an admin ban lasts until it is lifted, so drop any old expiry
+        ...(parsed.data.banned !== undefined && { banExpires: null }),
       },
       select: {
         id: true,
@@ -188,6 +200,14 @@ router.patch("/users/:id", async (req, res) => {
         banReason: true,
       },
     });
+
+    // Sign the user out everywhere when they are banned or deactivated
+    const [updated] = blocking
+      ? await prisma.$transaction([
+          updateUser,
+          prisma.session.deleteMany({ where: { userId } }),
+        ])
+      : [await updateUser];
 
     res.json(updated);
   } catch (error) {
@@ -227,8 +247,8 @@ router.get("/products", async (req, res) => {
 });
 
 router.delete("/products/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
 
@@ -238,11 +258,53 @@ router.delete("/products/:id", async (req, res) => {
       return res.status(404).json({ error: "Product not found" });
     }
 
+    // Deleting would cascade into order items and change past orders
+    const orderCount = await prisma.orderItem.count({ where: { productId: id } });
+    if (orderCount > 0) {
+      return res.status(409).json({
+        error: "This product appears in orders and can't be deleted. Set its stock to 0 instead.",
+      });
+    }
+
     await prisma.product.delete({ where: { id } });
     res.status(204).send();
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to delete product" });
+  }
+});
+
+// Only admins decide which products carry the Best Seller badge
+const productFlagsSchema = z.object({
+  isBestSeller: z.boolean(),
+});
+
+router.patch("/products/:id", async (req, res) => {
+  const id = parseId(req.params.id);
+  if (id === null) {
+    return res.status(400).json({ error: "Invalid product ID" });
+  }
+
+  const parsed = productFlagsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid data", details: parsed.error.issues });
+  }
+
+  try {
+    const product = await prisma.product.findUnique({ where: { id }, select: { id: true } });
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const updated = await prisma.product.update({
+      where: { id },
+      data: { isBestSeller: parsed.data.isBestSeller },
+      select: { id: true, name: true, isBestSeller: true },
+    });
+    res.json(updated);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to update product" });
   }
 });
 
@@ -276,12 +338,12 @@ router.get("/orders", async (req, res) => {
 });
 
 const orderStatusSchema = z.object({
-  status: z.enum(["PENDING", "SHIPPED", "DELIVERED", "CANCELLED"]),
+  status: z.enum(ORDER_STATUSES),
 });
 
 router.patch("/orders/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid order ID" });
   }
 
@@ -296,14 +358,46 @@ router.patch("/orders/:id", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    const updated = await prisma.order.update({
-      where: { id },
-      data: { status: parsed.data.status },
-      include: {
-        user: { select: { name: true, email: true } },
-        items: true,
-      },
+    const next = parsed.data.status;
+    if (!canTransition(order.status, next)) {
+      return res.status(400).json({
+        error: `Cannot change an order from ${order.status} to ${next}`,
+        allowed: ORDER_TRANSITIONS[order.status as OrderStatus] ?? [],
+      });
+    }
+
+    if (
+      next === "SHIPPED" &&
+      order.paymentMethod === "SSLCOMMERZ" &&
+      order.paymentStatus !== "PAID"
+    ) {
+      return res.status(400).json({ error: "This online order has not been paid yet" });
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      // Only apply the change if nobody moved the order in the meantime
+      const moved = await tx.order.updateMany({
+        where: { id, status: order.status },
+        data: { status: next },
+      });
+      if (moved.count === 0) return null;
+
+      if (next === "CANCELLED") {
+        await releaseOrderStock(tx, id);
+      }
+
+      return tx.order.findUnique({
+        where: { id },
+        include: {
+          user: { select: { name: true, email: true } },
+          items: true,
+        },
+      });
     });
+
+    if (!updated) {
+      return res.status(409).json({ error: "The order was just updated, please refresh" });
+    }
 
     res.json(updated);
   } catch (error) {
@@ -334,8 +428,8 @@ router.get("/reviews", async (_req, res) => {
 });
 
 router.delete("/reviews/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
+  const id = parseId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: "Invalid review ID" });
   }
 

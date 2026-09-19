@@ -2,6 +2,8 @@ import { Router } from "express";
 import { z } from "zod";
 import prisma from "../prisma.ts";
 import { requireSeller } from "../middleware/requireSeller.ts";
+import { parseId } from "../lib/params.ts";
+import { MAX_DISCOUNT_PERCENT } from "../lib/pricing.ts";
 
 const router = Router();
 
@@ -15,7 +17,7 @@ router.get("/dashboard", async (req, res) => {
   const sellerId = req.userId!;
 
   try {
-    const [productCount, lowStockCount, products, orderItems] = await Promise.all([
+    const [productCount, lowStockCount, products, orderItems, totalOrders] = await Promise.all([
       prisma.product.count({ where: { sellerId } }),
       prisma.product.count({
         where: { sellerId, stock: { lt: 5 } },
@@ -50,6 +52,10 @@ router.get("/dashboard", async (req, res) => {
         orderBy: { order: { createdAt: "desc" } },
         take: 10,
       }),
+      // every order that contains at least one of this seller's products
+      prisma.order.count({
+        where: { items: { some: { product: { sellerId } } } },
+      }),
     ]);
 
     // Calculate revenue only from DELIVERED orders
@@ -65,10 +71,6 @@ router.get("/dashboard", async (req, res) => {
       (sum, item) => sum + item.price * item.quantity,
       0
     );
-
-    // Unique orders count
-    const uniqueOrderIds = new Set(orderItems.map((item) => item.order.id));
-    const totalOrders = uniqueOrderIds.size;
 
     // Recent unique orders (last 5)
     const recentOrdersMap = new Map();
@@ -133,6 +135,15 @@ router.get("/products", async (req, res) => {
 // ======================
 // 3. ADD NEW PRODUCT
 // ======================
+const discountPercentSchema = z.coerce
+  .number()
+  .int()
+  .min(0)
+  .max(MAX_DISCOUNT_PERCENT, `Discount cannot be more than ${MAX_DISCOUNT_PERCENT}%`);
+
+// Whitelist of fields a seller may set. Zod drops unknown keys, so flags
+// that only admins control (isBestSeller, sellerId, ...) are ignored even
+// if a client sends them.
 const createProductSchema = z.object({
   name: z.string().trim().min(1).max(200),
   description: z.string().trim().min(1),
@@ -141,9 +152,8 @@ const createProductSchema = z.object({
   images: z.array(z.string().url()).default([]),
   stock: z.coerce.number().int().min(0).default(0),
   hasVariants: z.boolean().default(false),
-  discountPercent: z.coerce.number().int().min(0).max(100).optional().nullable(),
+  discountPercent: discountPercentSchema.optional().nullable(),
   saleEndsAt: z.coerce.date().optional().nullable(),
-  isBestSeller: z.boolean().default(false),
   variants: z
     .array(
       z.object({
@@ -171,12 +181,13 @@ router.post("/products", async (req, res) => {
   const data = parsed.data;
 
   try {
-    // Check unique name
-    const existing = await prisma.product.findUnique({
-      where: { name: data.name },
+    // Names only have to be unique within this seller's own store
+    const existing = await prisma.product.findFirst({
+      where: { sellerId, name: { equals: data.name, mode: "insensitive" } },
+      select: { id: true },
     });
     if (existing) {
-      return res.status(409).json({ error: "Product name already exists" });
+      return res.status(409).json({ error: "You already have a product with this name" });
     }
 
     const product = await prisma.product.create({
@@ -190,7 +201,6 @@ router.post("/products", async (req, res) => {
         hasVariants: data.hasVariants,
         discountPercent: data.discountPercent ?? null,
         saleEndsAt: data.saleEndsAt ?? null,
-        isBestSeller: data.isBestSeller,
         sellerId,
         ...(data.hasVariants && data.variants.length > 0
           ? {
@@ -216,13 +226,108 @@ router.post("/products", async (req, res) => {
 });
 
 // ======================
+// 3b. EDIT PRODUCT
+// ======================
+router.get("/products/:id", async (req, res) => {
+  const sellerId = req.userId!;
+  const productId = parseId(req.params.id);
+
+  if (productId === null) {
+    return res.status(400).json({ error: "Invalid product ID" });
+  }
+
+  try {
+    const product = await prisma.product.findFirst({
+      where: { id: productId, sellerId },
+      include: { variants: true },
+    });
+
+    if (!product) {
+      return res.status(404).json({ error: "Product not found or you don't own it" });
+    }
+
+    res.json(product);
+  } catch (error) {
+    console.error("Error fetching seller product:", error);
+    res.status(500).json({ error: "Failed to fetch product" });
+  }
+});
+
+// Same whitelist idea as create: listing details only. Stock is managed
+// from the inventory endpoints, and the Best Seller badge by admins.
+const updateProductSchema = z.object({
+  name: z.string().trim().min(1).max(200).optional(),
+  description: z.string().trim().min(1).optional(),
+  price: z.coerce.number().positive().optional(),
+  category: z.string().trim().min(1).optional(),
+  images: z.array(z.string().url()).optional(),
+  discountPercent: discountPercentSchema.optional().nullable(),
+  saleEndsAt: z.coerce.date().optional().nullable(),
+});
+
+router.patch("/products/:id", async (req, res) => {
+  const sellerId = req.userId!;
+  const productId = parseId(req.params.id);
+
+  if (productId === null) {
+    return res.status(400).json({ error: "Invalid product ID" });
+  }
+
+  const parsed = updateProductSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Invalid data",
+      details: parsed.error.issues,
+    });
+  }
+
+  const data = parsed.data;
+
+  try {
+    const product = await prisma.product.findFirst({
+      where: { id: productId, sellerId },
+      select: { id: true },
+    });
+
+    if (!product) {
+      return res.status(404).json({ error: "Product not found or you don't own it" });
+    }
+
+    if (data.name) {
+      const clash = await prisma.product.findFirst({
+        where: {
+          sellerId,
+          id: { not: productId },
+          name: { equals: data.name, mode: "insensitive" },
+        },
+        select: { id: true },
+      });
+      if (clash) {
+        return res.status(409).json({ error: "You already have a product with this name" });
+      }
+    }
+
+    const updated = await prisma.product.update({
+      where: { id: productId },
+      data,
+      include: { variants: true },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    console.error("Error updating product:", error);
+    res.status(500).json({ error: "Failed to update product" });
+  }
+});
+
+// ======================
 // 4. DELETE PRODUCT
 // ======================
 router.delete("/products/:id", async (req, res) => {
   const sellerId = req.userId!;
-  const productId = Number(req.params.id);
+  const productId = parseId(req.params.id);
 
-  if (!Number.isFinite(productId)) {
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
 
@@ -233,6 +338,15 @@ router.delete("/products/:id", async (req, res) => {
 
     if (!product) {
       return res.status(404).json({ error: "Product not found or you don't own it" });
+    }
+
+    // Order items cascade with the product, so deleting a product that was
+    // ever ordered would silently rewrite past orders and revenue.
+    const orderCount = await prisma.orderItem.count({ where: { productId } });
+    if (orderCount > 0) {
+      return res.status(409).json({
+        error: "This product has orders and can't be deleted. Set its stock to 0 to stop selling it.",
+      });
     }
 
     await prisma.product.delete({ where: { id: productId } });
@@ -273,20 +387,26 @@ router.get("/inventory", async (req, res) => {
   }
 });
 
+// Stock must be a whole, non-negative number. Number("2.5") used to pass
+// and then failed inside Prisma because the column is an INT.
+const stockBodySchema = z.object({
+  stock: z.coerce.number().int().min(0).max(1_000_000),
+});
+
 // Update product stock
 router.patch("/products/:id/stock", async (req, res) => {
   const sellerId = req.userId!;
-  const productId = Number(req.params.id);
-  const { stock } = req.body;
+  const productId = parseId(req.params.id);
 
-  if (!Number.isFinite(productId)) {
+  if (productId === null) {
     return res.status(400).json({ error: "Invalid product ID" });
   }
 
-  const stockNum = Number(stock);
-  if (!Number.isFinite(stockNum) || stockNum < 0) {
-    return res.status(400).json({ error: "Invalid stock value" });
+  const parsedStock = stockBodySchema.safeParse(req.body);
+  if (!parsedStock.success) {
+    return res.status(400).json({ error: "Stock must be a whole number of 0 or more" });
   }
+  const stockNum = parsedStock.data.stock;
 
   try {
     const product = await prisma.product.findFirst({
@@ -312,17 +432,17 @@ router.patch("/products/:id/stock", async (req, res) => {
 // Update variant stock
 router.patch("/variants/:id/stock", async (req, res) => {
   const sellerId = req.userId!;
-  const variantId = Number(req.params.id);
-  const { stock } = req.body;
+  const variantId = parseId(req.params.id);
 
-  if (!Number.isFinite(variantId)) {
+  if (variantId === null) {
     return res.status(400).json({ error: "Invalid variant ID" });
   }
 
-  const stockNum = Number(stock);
-  if (!Number.isFinite(stockNum) || stockNum < 0) {
-    return res.status(400).json({ error: "Invalid stock value" });
+  const parsedStock = stockBodySchema.safeParse(req.body);
+  if (!parsedStock.success) {
+    return res.status(400).json({ error: "Stock must be a whole number of 0 or more" });
   }
+  const stockNum = parsedStock.data.stock;
 
   try {
     const variant = await prisma.productVariant.findUnique({

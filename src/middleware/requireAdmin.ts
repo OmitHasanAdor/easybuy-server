@@ -1,39 +1,20 @@
 import type { Request, Response, NextFunction } from "express";
-import prisma from "../prisma.ts";
+import { authenticate } from "./requireAuth.ts";
 
 export async function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  const header = req.headers.authorization;
-  const token = header?.startsWith("Bearer ") ? header.slice(7).trim() : null;
-
-  if (!token) {
-    return res.status(401).json({ error: "Sign in required" });
-  }
-
   try {
-    const session = await prisma.session.findUnique({ where: { token } });
+    const result = await authenticate(req);
 
-    if (!session || session.expiresAt < new Date()) {
-      return res.status(401).json({ error: "Session expired, please sign in again" });
+    if (!result.ok) {
+      return res.status(result.status).json({ error: result.error });
     }
 
-    const user = await prisma.user.findUnique({
-      where: { id: session.userId },
-      select: { id: true, role: true, status: true },
-    });
-
-    if (!user) {
-      return res.status(401).json({ error: "User not found" });
-    }
-
-    if (user.status !== "active") {
-      return res.status(403).json({ error: "Account is not active" });
-    }
-
-    if (user.role !== "admin") {
+    if (result.role !== "admin") {
       return res.status(403).json({ error: "Admin access required" });
     }
 
-    req.userId = user.id;
+    req.userId = result.id;
+    req.userRole = result.role;
     next();
   } catch (error) {
     console.error("Error in requireAdmin:", error);

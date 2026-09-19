@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 const STORE_ID = process.env.SSLCOMMERZ_STORE_ID!;
 const STORE_PASSWORD = process.env.SSLCOMMERZ_STORE_PASSWORD!;
 const ENV = process.env.SSLCOMMERZ_ENV || "sandbox";
@@ -11,14 +13,6 @@ const INIT_URL = isLive
 const VALIDATION_URL = isLive
   ? "https://securepay.sslcommerz.com/validator/api/validationserverAPI.php"
   : "https://sandbox.sslcommerz.com/validator/api/validationserverAPI.php";
-
-  console.log("SSL check", {
-  id: STORE_ID,
-  idLen: STORE_ID?.length,
-  passLen: STORE_PASSWORD?.length,
-  env: ENV,
-  initUrl: INIT_URL,
-});
 
 export type InitiateSslParams = {
   totalAmount: number;
@@ -87,18 +81,72 @@ export async function initiateSslPayment(
   return res.json() as Promise<InitiateSslResult>;
 }
 
+const md5 = (value: string) => createHash("md5").update(value).digest("hex");
+
+// IPN posts are signed by SSLCommerz: verify_sign is the md5 of the fields
+// named in verify_key plus md5(store password), joined as key=value pairs
+// sorted by key. Used for FAILED/CANCELLED notifications, which have no
+// val_id that could be checked through the validation API instead.
+export function verifyIpnSignature(body: Record<string, unknown>) {
+  const sign = body.verify_sign;
+  const keys = body.verify_key;
+  if (typeof sign !== "string" || typeof keys !== "string" || !STORE_PASSWORD) {
+    return false;
+  }
+
+  const fields: Record<string, string> = {};
+  for (const key of keys.split(",")) {
+    const value = body[key];
+    if (typeof value === "string") fields[key] = value;
+  }
+  fields.store_passwd = md5(STORE_PASSWORD);
+
+  const hashString = Object.keys(fields)
+    .sort()
+    .map((key) => `${key}=${fields[key]}`)
+    .join("&");
+
+  return md5(hashString) === sign;
+}
+
 export type ValidateSslResult = {
   status: string;
   tran_id?: string;
   val_id?: string;
   amount?: string;
+  currency?: string;
   card_type?: string;
   store_amount?: string;
 };
 
+// A VALID response only proves that *some* payment went through. Before
+// trusting it for an order, make sure it is this order's transaction and
+// that the full amount was paid in taka — otherwise the val_id of a cheap
+// payment could be replayed to mark an expensive order as paid.
+export function paymentMatchesOrder(
+  validation: ValidateSslResult,
+  order: { transactionId: string | null; total: number }
+) {
+  if (validation.status !== "VALID" && validation.status !== "VALIDATED") {
+    return false;
+  }
+  if (!order.transactionId || validation.tran_id !== order.transactionId) {
+    return false;
+  }
+  if (validation.currency && validation.currency !== "BDT") {
+    return false;
+  }
+  const paid = Number(validation.amount);
+  return Number.isFinite(paid) && Math.abs(paid - order.total) < 0.01;
+}
+
 export async function validateSslPayment(
   valId: string
 ): Promise<ValidateSslResult> {
+  if (!STORE_ID || !STORE_PASSWORD) {
+    throw new Error("SSLCommerz credentials missing in env");
+  }
+
   const url = new URL(VALIDATION_URL);
   url.searchParams.set("val_id", valId);
   url.searchParams.set("store_id", STORE_ID);
