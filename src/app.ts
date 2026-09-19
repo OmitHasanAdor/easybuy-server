@@ -983,31 +983,30 @@ async function markOrderPaid(tranId: string) {
       data: { paymentStatus: "PAID", paidAt: new Date() },
     });
 
-    const order = await tx.order.findUnique({
+    const order = await tx.order.findFirst({
       where: { transactionId: tranId },
       include: { items: true },
     });
     if (!order || claimed.count === 0) return order;
 
     if (order.status === "CANCELLED") {
-      // Money arrived for an order that was already cancelled. Keep it
-      // cancelled and leave stock alone so an admin can refund it.
       console.warn("Payment received for a cancelled order", { orderId: order.id });
       return order;
     }
 
     try {
       await deductStock(tx, order.items);
-      await tx.order.update({ where: { id: order.id }, data: { stockDeducted: true } });
+      await tx.order.update({
+        where: { id: order.id },
+        data: { stockDeducted: true },
+      });
     } catch (error) {
       if (!(error instanceof OutOfStockError)) throw error;
-      // The buyer has already paid, so the payment stays recorded. Stock ran
-      // out while they were on the gateway page; an admin has to restock or
-      // cancel and refund.
-      console.warn("Paid order could not be taken from stock", { orderId: order.id });
+      console.warn("Paid order could not be taken from stock", {
+        orderId: order.id,
+      });
     }
 
-    // Remove what was bought from the cart, keep anything added since
     await tx.cartItem.deleteMany({
       where: {
         userId: order.userId,
