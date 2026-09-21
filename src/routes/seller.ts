@@ -4,6 +4,7 @@ import prisma from "../prisma.ts";
 import { requireSeller } from "../middleware/requireSeller.ts";
 import { parseId } from "../lib/params.ts";
 import { MAX_DISCOUNT_PERCENT } from "../lib/pricing.ts";
+import { generateListing } from "../lib/listingCopilot.ts";
 
 const router = Router();
 
@@ -632,6 +633,39 @@ const updateProfileSchema = z.object({
   image: z.string().url().optional().nullable(),
   storeName: z.string().trim().min(1).max(100).optional(),
   storeDescription: z.string().trim().max(500).optional().nullable(),
+});
+
+
+const listingBodySchema = z.object({
+  name: z.string().trim().max(120).optional(),
+  category: z.string().trim().max(80).optional(),
+  price: z.coerce.number().min(0).max(1_000_000).optional(),
+  notes: z.string().trim().max(1000).optional(),
+});
+
+// POST /api/seller/listing-copilot
+router.post("/listing-copilot", async (req, res) => {
+  const parsed = listingBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Invalid body",
+      details: parsed.error.issues,
+    });
+  }
+
+  if (!parsed.data.name && !parsed.data.notes && !parsed.data.category) {
+    return res.status(400).json({
+      error: "Provide at least a name, category, or notes",
+    });
+  }
+
+  try {
+    const listing = await generateListing(parsed.data);
+    return res.json(listing);
+  } catch (error) {
+    console.error("ListingCopilot error:", error);
+    return res.status(500).json({ error: "Failed to generate listing" });
+  }
 });
 
 router.patch("/profile", async (req, res) => {
