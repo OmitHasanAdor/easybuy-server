@@ -3,6 +3,8 @@ import cors from "cors";
 import { z } from "zod";
 import prisma from "./prisma.ts";
 import { requireAuth } from "./middleware/requireAuth.ts";
+import { suggestOutfit } from "./lib/chatOutfit.ts";
+// import { generateTryOnImage, type TryOnMode } from "./lib/tryOn.ts";
 import sellerRoutes from "./routes/seller.ts";
 import adminRoutes from "./routes/admin.ts";
 import {
@@ -17,10 +19,10 @@ import { unitPrice } from "./lib/pricing.ts";
 import { deductStock, OutOfStockError, releaseOrderStock } from "./lib/orders.ts";
 
 const app = express();
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.disable("x-powered-by");
 app.use(cors(corsOptions));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // SSLCommerz IPN
 
 app.get("/", (req, res) => {
   res.send("EasyBuy Server is Running");
@@ -1105,6 +1107,116 @@ app.post("/api/payments/sslcommerz/confirm", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Confirmation failed" });
   }
 });
+
+
+
+
+app.post("/api/chat", async (req, res) => {
+  const message =
+    typeof req.body?.message === "string" ? req.body.message.trim() : "";
+  if (!message || message.length > 1000) {
+    return res.status(400).json({ error: "Please send a short message" });
+  }
+
+  try {
+    const result = await suggestOutfit(message);
+    return res.json(result);
+  } catch (error) {
+    console.error("Chat error:", error);
+    return res.status(500).json({ error: "Chat failed" });
+  }
+});
+
+
+// function modeFromCategory(category: string): TryOnMode | null {
+//   const c = category.toLowerCase();
+//   if (c.includes("home") || c.includes("lifestyle")) return "in_room";
+//   if (c.includes("men") || c.includes("women") || c.includes("fashion")) {
+//     return "try_on";
+//   }
+//   return null;
+// }
+
+// const tryOnBodySchema = z.object({
+//   productId: z.coerce.number().int().positive(),
+//   // data URL: data:image/jpeg;base64,....
+//   image: z.string().min(100).max(6_000_000),
+// });
+
+// app.post("/api/try-on", requireAuth, async (req, res) => {
+//   const parsed = tryOnBodySchema.safeParse(req.body);
+//   if (!parsed.success) {
+//     return res.status(400).json({ error: "Invalid body", details: parsed.error.issues });
+//   }
+
+//   if (!process.env.GEMINI_API_KEY) {
+//     return res.status(503).json({ error: "Try-on is not configured" });
+//   }
+
+//   const { productId, image } = parsed.data;
+
+//   const match = /^data:(image\/(?:jpeg|jpg|png|webp));base64,(.+)$/i.exec(image);
+//   if (!match) {
+//     return res.status(400).json({ error: "Image must be a JPEG or PNG data URL" });
+//   }
+//   const userMime = match[1].toLowerCase().replace("jpg", "jpeg");
+//   const userImageBase64 = match[2];
+
+//   try {
+//     const product = await prisma.product.findUnique({
+//       where: { id: productId },
+//       select: { id: true, category: true, images: true, name: true },
+//     });
+//     if (!product) return res.status(404).json({ error: "Product not found" });
+
+//     const mode = modeFromCategory(product.category);
+//     if (!mode) {
+//       return res.status(400).json({
+//         error: "Try-on is only available for fashion and home products",
+//       });
+//     }
+
+//     const productUrl = product.images?.[0];
+//     if (!productUrl) {
+//       return res.status(400).json({ error: "Product has no image" });
+//     }
+
+//     const productRes = await fetch(productUrl);
+//     if (!productRes.ok) {
+//       return res.status(502).json({ error: "Could not load product image" });
+//     }
+//     const productBuf = Buffer.from(await productRes.arrayBuffer());
+//     const productMime =
+//       productRes.headers.get("content-type")?.split(";")[0] || "image/jpeg";
+//     const productImageBase64 = productBuf.toString("base64");
+
+//     const result = await generateTryOnImage({
+//       mode,
+//       userImageBase64,
+//       userMime: userMime.startsWith("image/") ? userMime : `image/${userMime}`,
+//       productImageBase64,
+//       productMime,
+//     });
+
+//     // do not store user photo — only return result
+//     return res.json({
+//       mode,
+//       productId: product.id,
+//       productName: product.name,
+//       mimeType: result.mimeType,
+//       image: `data:${result.mimeType};base64,${result.base64}`,
+//     });
+//   } catch (error) {
+//     console.error("Try-on error:", error);
+//     const msg = error instanceof Error ? error.message : "Try-on failed";
+//     // free tier quota
+//     if (/429|resource.exhausted|quota/i.test(msg)) {
+//       return res.status(429).json({ error: "Daily AI limit reached, try again later" });
+//     }
+//     return res.status(500).json({ error: "Failed to generate preview" });
+//   }
+// });
+
 
 app.use("/api/seller", sellerRoutes);
 app.use("/api/admin", adminRoutes);
