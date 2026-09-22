@@ -186,6 +186,7 @@ model user {
   // Products owned by this seller
   products       Product[]
   addresses Address[]
+  notifications Notification[]
 }
 
 model verification {
@@ -257,4 +258,19 @@ model Address {
   user user @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+}
+
+model Notification {
+  id        Int      @id @default(autoincrement())
+  userId    String
+  title     String
+  body      String
+  link      String?  // e.g. /dashboard/buyer/orders
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user user @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+  @@index([userId, createdAt])
 }
