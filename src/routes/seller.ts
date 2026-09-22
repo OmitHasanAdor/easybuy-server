@@ -5,6 +5,7 @@ import { requireSeller } from "../middleware/requireSeller.ts";
 import { parseId } from "../lib/params.ts";
 import { MAX_DISCOUNT_PERCENT } from "../lib/pricing.ts";
 import { generateListing } from "../lib/listingCopilot.ts";
+import { buildStockMind } from "../lib/stockMind.ts";
 
 const router = Router();
 
@@ -665,6 +666,19 @@ router.post("/listing-copilot", async (req, res) => {
   } catch (error) {
     console.error("ListingCopilot error:", error);
     return res.status(500).json({ error: "Failed to generate listing" });
+  }
+});
+
+// GET /api/seller/stock-mind
+router.get("/stock-mind", async (req, res) => {
+  try {
+    // req.userId from requireAuth — same as other seller routes
+    const sellerId = req.userId!;
+    const data = await buildStockMind(sellerId);
+    return res.json(data);
+  } catch (error) {
+    console.error("StockMind error:", error);
+    return res.status(500).json({ error: "Failed to load stock insights" });
   }
 });
 
