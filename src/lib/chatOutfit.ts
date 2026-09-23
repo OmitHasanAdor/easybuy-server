@@ -4,22 +4,15 @@ import prisma from "../prisma.ts";
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
 
-type Intent =
-  | "specific_item"
-  | "outfit"
-  | "sale"
-  | "general";
+type Intent = "specific_item" | "outfit" | "sale" | "general";
 
 type ChatPlan = {
   intent: Intent;
   minPrice?: number;
   maxPrice?: number;
   categories: string[];
-  /** must match product name/description (OR) */
   nameContains: string[];
-  /** prefer these words in name */
   preferInName: string[];
-  /** exclude products whose name matches */
   excludeName: string[];
   onlyDiscounted: boolean;
   gender: "men" | "women" | "any";
@@ -107,23 +100,30 @@ function detectGender(m: string): ChatPlan["gender"] {
 }
 
 function parseBudget(m: string): { minPrice?: number; maxPrice?: number } {
-  const range = m.match(/(\d{3,6})\s*[-–to]+\s*(\d{3,6})/);
+  const t = m.replace(/৳/g, "").replace(/,/g, "");
+  const range = t.match(/(\d{3,6})\s*[-–—to]+\s*(\d{3,6})/i);
   if (range) {
     return { minPrice: Number(range[1]), maxPrice: Number(range[2]) };
   }
-  const under = m.match(
-    /(?:under|below|max|within|up\s*to|less\s*than)\s*৳?\s*(\d{3,6})/i
+  const under = t.match(
+    /(?:under|below|max|within|up\s*to|less\s*than)\s*(\d{3,6})/i
   );
   if (under) return { maxPrice: Number(under[1]) };
 
-  const budget = m.match(
+  const budget = t.match(
     /budget\s*(?:of|is|=|:)?\s*(\d{3,6})|(\d{3,6})\s*(?:tk|taka)/i
   );
   if (budget) {
     const n = Number(budget[1] || budget[2]);
-    return { minPrice: Math.floor(n * 0.25), maxPrice: n };
+    return { maxPrice: n };
   }
   return {};
+}
+
+function fashionCategories(gender: ChatPlan["gender"]): string[] {
+  if (gender === "women") return ["Women's Fashion"];
+  if (gender === "men") return ["Men's Fashion"];
+  return ["Men's Fashion", "Women's Fashion"];
 }
 
 function ruleBasedPlan(message: string): ChatPlan {
@@ -132,19 +132,17 @@ function ruleBasedPlan(message: string): ChatPlan {
   const gender = detectGender(m);
   const color = m.match(COLOR)?.[0];
 
-  // --- SALE / OFFERS ---
   if (SALE.test(m)) {
-    const cats =
-      gender === "women"
-        ? ["Women's Fashion"]
-        : gender === "men"
-          ? ["Men's Fashion"]
-          : ["Men's Fashion", "Women's Fashion", "Home & Lifestyle"];
     return {
       intent: "sale",
       minPrice,
       maxPrice,
-      categories: cats,
+      categories:
+        gender === "women"
+          ? ["Women's Fashion"]
+          : gender === "men"
+            ? ["Men's Fashion"]
+            : ["Men's Fashion", "Women's Fashion", "Home & Lifestyle"],
       nameContains: color ? [color] : [],
       preferInName: color ? [color] : [],
       excludeName: [],
@@ -154,10 +152,32 @@ function ruleBasedPlan(message: string): ChatPlan {
     };
   }
 
-  // --- SPECIFIC ITEM (shirt, shoe, …) ---
-  for (const rule of ITEM_RULES) {
-    if (!rule.keys.test(m)) continue;
+  const matchedRules = ITEM_RULES.filter((rule) => rule.keys.test(m));
 
+  // shirt + pant (or any multi item) → outfit-style multi pick
+  if (matchedRules.length >= 2) {
+    const nameContains = [
+      ...new Set(matchedRules.flatMap((r) => r.nameContains)),
+    ];
+    const preferInName = [
+      ...new Set(matchedRules.flatMap((r) => r.preferInName)),
+    ];
+    return {
+      intent: "outfit",
+      minPrice,
+      maxPrice,
+      categories: fashionCategories(gender),
+      nameContains,
+      preferInName,
+      excludeName: ["belt"],
+      onlyDiscounted: false,
+      gender,
+      reply: "Here are pieces that match the items you asked for.",
+    };
+  }
+
+  if (matchedRules.length === 1) {
+    const rule = matchedRules[0];
     let categories = [...rule.categories];
     if (gender === "men") {
       categories = categories.filter((c) => c !== "Women's Fashion");
@@ -191,19 +211,15 @@ function ruleBasedPlan(message: string): ChatPlan {
     };
   }
 
-  // --- OCCASION → outfit mix (not random accessories only) ---
-  if (OCCASION.test(m) || /\b(outfit|full\s*dress|complete\s*look|পোশাক)\b/i.test(m)) {
-    const cats =
-      gender === "women"
-        ? ["Women's Fashion"]
-        : gender === "men"
-          ? ["Men's Fashion"]
-          : ["Men's Fashion", "Women's Fashion"];
+  if (
+    OCCASION.test(m) ||
+    /\b(outfit|full\s*dress|complete\s*look|পোশাক)\b/i.test(m)
+  ) {
     return {
       intent: "outfit",
       minPrice,
       maxPrice,
-      categories: cats,
+      categories: fashionCategories(gender),
       nameContains: [],
       preferInName: ["shirt", "pant", "dress", "chino", "trouser"],
       excludeName: [],
@@ -214,17 +230,11 @@ function ruleBasedPlan(message: string): ChatPlan {
     };
   }
 
-  // --- GENERAL ---
   return {
     intent: "general",
     minPrice,
     maxPrice,
-    categories:
-      gender === "women"
-        ? ["Women's Fashion"]
-        : gender === "men"
-          ? ["Men's Fashion"]
-          : ["Men's Fashion", "Women's Fashion"],
+    categories: fashionCategories(gender),
     nameContains: color ? [color] : [],
     preferInName: color ? [color] : [],
     excludeName: [],
@@ -234,7 +244,10 @@ function ruleBasedPlan(message: string): ChatPlan {
   };
 }
 
-async function llmRefinePlan(message: string, base: ChatPlan): Promise<ChatPlan> {
+async function llmRefinePlan(
+  message: string,
+  base: ChatPlan
+): Promise<ChatPlan> {
   if (!process.env.GEMINI_API_KEY) return base;
 
   try {
@@ -261,9 +274,11 @@ Return ONLY JSON:
 }
 
 Rules:
-- If user asks for shirt/pant/shoe/watch/belt/dress, intent=specific_item and nameContains must include that product type. Never mix shoes when user asked shirt.
+- If user asks for shirt/pant/shoe/watch/belt/dress, intent=specific_item and nameContains must include that product type. Never mix shoes when user asked only shirt.
+- If user asks for multiple items (shirt and pant), intent=outfit and nameContains lists both types.
 - If user only mentions occasion (wedding/party), intent=outfit.
 - If user asks sale/offer/discount, onlyDiscounted=true.
+- Budget ranges are total spend hints; maxPrice matters most.
 - Prices in BDT.`,
             },
           ],
@@ -319,12 +334,24 @@ function nameMatchesNone(name: string, words: string[]): boolean {
   return words.every((w) => !n.includes(w.toLowerCase()));
 }
 
+type ProductRow = {
+  id: number;
+  name: string;
+  price: number;
+  category: string;
+  images: string[];
+  discountPercent: number | null;
+  saleEndsAt: Date | null;
+};
+
 export async function suggestOutfit(message: string) {
-  const base = ruleBasedPlan(message.trim());
-  const plan = await llmRefinePlan(message.trim(), base);
+  const trimmed = message.trim();
+  const base = ruleBasedPlan(trimmed);
+  const plan = await llmRefinePlan(trimmed, base);
 
   const maxBudget = plan.maxPrice ?? null;
-  const minBudget = plan.minPrice ?? 0;
+  // Do NOT apply min as hard floor on each product — ranges are total-budget hints.
+  // Only use maxPrice in SQL so ৳1450 shirt still appears for "budget 3000-6000".
   const now = new Date();
 
   const products = await prisma.product.findMany({
@@ -332,7 +359,6 @@ export async function suggestOutfit(message: string) {
       stock: { gt: 0 },
       category: { in: plan.categories },
       price: {
-        gte: minBudget,
         ...(maxBudget != null ? { lte: maxBudget } : {}),
       },
       ...(plan.onlyDiscounted
@@ -357,8 +383,7 @@ export async function suggestOutfit(message: string) {
     },
   });
 
-  // text filters (shirt ≠ belt/shoe)
-  let filtered = products.filter(
+  let filtered: ProductRow[] = products.filter(
     (p) =>
       nameMatchesNone(p.name, plan.excludeName) &&
       (plan.nameContains.length === 0 ||
@@ -366,7 +391,6 @@ export async function suggestOutfit(message: string) {
         nameMatchesAny(p.name, plan.preferInName))
   );
 
-  // specific_item: strict — if nothing matched nameContains, don't show random other types
   if (plan.intent === "specific_item" && plan.nameContains.length) {
     const strict = products.filter(
       (p) =>
@@ -376,7 +400,6 @@ export async function suggestOutfit(message: string) {
     filtered = strict.length ? strict : [];
   }
 
-  // rank: preferred words first, then color-ish
   filtered.sort((a, b) => {
     const score = (name: string) =>
       plan.preferInName.reduce(
@@ -386,27 +409,41 @@ export async function suggestOutfit(message: string) {
     return score(b.name) - score(a.name) || a.price - b.price;
   });
 
-  const picked: typeof filtered = [];
-  const usedCats = new Set<string>();
+  const picked: ProductRow[] = [];
   let total = 0;
 
   if (plan.intent === "outfit") {
-    // prefer core clothing first
-    const core = filtered.filter((p) =>
-      /shirt|pant|dress|chino|trouser|jean|top|kurti/i.test(p.name)
-    );
-    const rest = filtered.filter((p) => !core.includes(p));
-    const ordered = [...core, ...rest];
-
-    for (const p of ordered) {
-      if (picked.length >= 6) break;
-      if (maxBudget != null && total + p.price > maxBudget) continue;
-      if (usedCats.has(p.category) && picked.length < 2) {
-        // still ok to add different product types
+    // One product per requested type when nameContains has multiple (shirt + pant)
+    if (plan.nameContains.length >= 2) {
+      const usedIds = new Set<number>();
+      for (const word of plan.nameContains) {
+        const hit = filtered.find(
+          (p) =>
+            !usedIds.has(p.id) &&
+            p.name.toLowerCase().includes(word.toLowerCase()) &&
+            (maxBudget == null || total + p.price <= maxBudget)
+        );
+        if (hit) {
+          picked.push(hit);
+          usedIds.add(hit.id);
+          total += hit.price;
+        }
       }
-      picked.push(p);
-      usedCats.add(p.category);
-      total += p.price;
+    }
+
+    if (picked.length === 0) {
+      const core = filtered.filter((p) =>
+        /shirt|pant|dress|chino|trouser|jean|top|kurti/i.test(p.name)
+      );
+      const rest = filtered.filter((p) => !core.includes(p));
+      const ordered = [...core, ...rest];
+
+      for (const p of ordered) {
+        if (picked.length >= 6) break;
+        if (maxBudget != null && total + p.price > maxBudget) continue;
+        picked.push(p);
+        total += p.price;
+      }
     }
   } else {
     for (const p of filtered) {
@@ -417,17 +454,31 @@ export async function suggestOutfit(message: string) {
     }
   }
 
+  // Last resort: anything in category under max budget
+  if (picked.length === 0 && maxBudget != null) {
+    const relaxed = products
+      .filter((p) => nameMatchesNone(p.name, plan.excludeName))
+      .slice(0, 6);
+    for (const p of relaxed) {
+      if (total + p.price > maxBudget && picked.length > 0) continue;
+      if (maxBudget != null && p.price > maxBudget) continue;
+      picked.push(p);
+      total += p.price;
+      if (picked.length >= 6) break;
+    }
+  }
+
   let reply = plan.reply;
   if (picked.length === 0) {
     reply = plan.onlyDiscounted
-      ? "No active sale items match that right now. Try without ‘sale’, or another category."
+      ? "No active sale items match that right now. Try without “sale”, or another category."
       : plan.intent === "specific_item"
         ? "No matching items in stock for that request. Try another color, budget, or product type."
         : maxBudget
-          ? `Nothing in stock under ৳${maxBudget.toLocaleString()} for that. Try a higher budget.`
+          ? `Nothing in stock under ৳${maxBudget.toLocaleString()} for that. Try a higher budget or different item.`
           : "No matching products right now.";
   } else if (maxBudget != null && plan.intent === "outfit") {
-    reply = `${plan.reply} Combined total: ৳${total.toLocaleString()} (budget ৳${maxBudget.toLocaleString()}).`;
+    reply = `${plan.reply} Combined total: ৳${total.toLocaleString()} (within ৳${maxBudget.toLocaleString()}).`;
   }
 
   return {
