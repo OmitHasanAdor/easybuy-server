@@ -5,6 +5,10 @@ import prisma from "./prisma.ts";
 import { requireAuth } from "./middleware/requireAuth.ts";
 import { suggestOutfit } from "./lib/chatOutfit.ts";
 // import { generateTryOnImage, type TryOnMode } from "./lib/tryOn.ts";
+import {
+  createNotification,
+  createNotifications,
+} from "./lib/notifications.ts";
 import sellerRoutes from "./routes/seller.ts";
 import adminRoutes from "./routes/admin.ts";
 import {
@@ -786,6 +790,28 @@ const checkoutSchema = z.object({
   postalCode: z.string().trim().max(20).optional().nullable(),
 });
 
+function sellerIdsFromCart(
+  cartItems: { product: { sellerId: string | null } }[]
+): string[] {
+  return [
+    ...new Set(
+      cartItems
+        .map((i) => i.product.sellerId)
+        .filter((id): id is string => typeof id === "string" && id.length > 0)
+    ),
+  ];
+}
+
+async function notifyQuietly(
+  fn: () => Promise<unknown>
+): Promise<void> {
+  try {
+    await fn();
+  } catch (e) {
+    console.error("Notification error:", e);
+  }
+}
+
 app.post("/api/checkout", requireAuth, async (req, res) => {
   const parsed = checkoutSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -854,11 +880,9 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
       .join(", ")
       .slice(0, 200);
 
-    // ── COD ──────────────────────────────────────────
+      // ── COD ──────────────────────────────────────────
     if (paymentMethod === "COD") {
       const order = await prisma.$transaction(async (tx) => {
-        // throws OutOfStockError (and rolls everything back) if another
-        // buyer got the last units after the check above
         await deductStock(tx, lineItems);
 
         const newOrder = await tx.order.create({
@@ -877,11 +901,31 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
           },
         });
 
-        // only the rows that went into this order
         await tx.cartItem.deleteMany({
           where: { id: { in: cartItems.map((item) => item.id) } },
         });
         return newOrder;
+      });
+
+      await notifyQuietly(async () => {
+        await createNotification({
+          userId: order.userId,
+          title: "Order placed",
+          body: `Order #${order.id} · ৳${order.total.toLocaleString()} (Cash on delivery)`,
+          link: "/dashboard/buyer/orders",
+        });
+
+        const sellers = sellerIdsFromCart(cartItems);
+        if (sellers.length > 0) {
+          await createNotifications(
+            sellers.map((sellerId) => ({
+              userId: sellerId,
+              title: "New order received",
+              body: `Order #${order.id} · ৳${order.total.toLocaleString()} (COD)`,
+              link: "/dashboard/seller/orders",
+            }))
+          );
+        }
       });
 
       return res.status(201).json({
@@ -911,9 +955,28 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
           items: { create: lineItems },
         },
       });
-
-      // Stock is taken once the payment is verified (see markOrderPaid)
       return newOrder;
+    });
+
+    await notifyQuietly(async () => {
+      await createNotification({
+        userId: order.userId,
+        title: "Order placed — complete payment",
+        body: `Order #${order.id} · ৳${order.total.toLocaleString()}. Finish payment to confirm.`,
+        link: "/dashboard/buyer/orders",
+      });
+
+      const sellers = sellerIdsFromCart(cartItems);
+      if (sellers.length > 0) {
+        await createNotifications(
+          sellers.map((sellerId) => ({
+            userId: sellerId,
+            title: "New order (awaiting payment)",
+            body: `Order #${order.id} · ৳${order.total.toLocaleString()}`,
+            link: "/dashboard/seller/orders",
+          }))
+        );
+      }
     });
 
     const frontend = process.env.FRONTEND_URL || process.env.APP_URL || "http://localhost:3000";
@@ -946,15 +1009,31 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
         valueB: tranId,
       });
     } catch (error) {
-      // gateway unreachable or misconfigured: don't leave a dangling
-      // PENDING order behind that an admin might ship unpaid
       console.error("SSLCommerz init error:", error);
       await closeUnpaidOrder();
-      return res.status(502).json({ error: "Payment gateway is unavailable, please try again" });
+      await notifyQuietly(() =>
+        createNotification({
+          userId: order.userId,
+          title: "Payment failed",
+          body: `Payment for order #${order.id} could not start. Try checkout again.`,
+          link: "/dashboard/buyer/orders",
+        })
+      );
+      return res.status(502).json({
+        error: "Payment gateway is unavailable, please try again",
+      });
     }
 
     if (ssl.status !== "SUCCESS" || !ssl.GatewayPageURL) {
       await closeUnpaidOrder();
+      await notifyQuietly(() =>
+        createNotification({
+          userId: order.userId,
+          title: "Payment failed",
+          body: `Payment for order #${order.id} was rejected. Try checkout again.`,
+          link: "/dashboard/buyer/orders",
+        })
+      );
       return res.status(502).json({
         error: ssl.failedreason || "Payment gateway rejected the request",
       });
@@ -979,48 +1058,92 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
 // so the UNPAID -> PAID switch is a single conditional update: only the
 // call that actually flips it goes on to touch stock and the cart.
 async function markOrderPaid(tranId: string) {
-  return prisma.$transaction(async (tx) => {
+  const result = await prisma.$transaction(async (tx) => {
     const claimed = await tx.order.updateMany({
       where: { transactionId: tranId, paymentStatus: { not: "PAID" } },
       data: { paymentStatus: "PAID", paidAt: new Date() },
     });
 
-    const order = await tx.order.findFirst({
+    const found = await tx.order.findFirst({
       where: { transactionId: tranId },
-      include: { items: true },
+      include: {
+        items: {
+          include: { product: { select: { sellerId: true } } },
+        },
+      },
     });
-    if (!order || claimed.count === 0) return order;
 
-    if (order.status === "CANCELLED") {
-      console.warn("Payment received for a cancelled order", { orderId: order.id });
-      return order;
+    if (!found || claimed.count === 0) {
+      return { order: found, newlyPaid: false as const };
+    }
+
+    if (found.status === "CANCELLED") {
+      console.warn("Payment received for a cancelled order", {
+        orderId: found.id,
+      });
+      return { order: found, newlyPaid: false as const };
     }
 
     try {
-      await deductStock(tx, order.items);
+      await deductStock(tx, found.items);
       await tx.order.update({
-        where: { id: order.id },
+        where: { id: found.id },
         data: { stockDeducted: true },
       });
     } catch (error) {
       if (!(error instanceof OutOfStockError)) throw error;
       console.warn("Paid order could not be taken from stock", {
-        orderId: order.id,
+        orderId: found.id,
       });
     }
 
     await tx.cartItem.deleteMany({
       where: {
-        userId: order.userId,
-        OR: order.items.map((item) => ({
+        userId: found.userId,
+        OR: found.items.map((item) => ({
           productId: item.productId,
           variantId: item.variantId,
         })),
       },
     });
 
-    return order;
+    return { order: found, newlyPaid: true as const };
   });
+
+  if (result.newlyPaid && result.order) {
+    const order = result.order;
+    await notifyQuietly(async () => {
+      await createNotification({
+        userId: order.userId,
+        title: "Payment successful",
+        body: `Order #${order.id} is paid. Thank you!`,
+        link: "/dashboard/buyer/orders",
+      });
+
+      const sellers = [
+        ...new Set(
+          order.items
+            .map((i) => i.product?.sellerId)
+            .filter(
+              (id): id is string => typeof id === "string" && id.length > 0
+            )
+        ),
+      ];
+
+      if (sellers.length > 0) {
+        await createNotifications(
+          sellers.map((sellerId) => ({
+            userId: sellerId,
+            title: "Order paid",
+            body: `Order #${order.id} · ৳${order.total.toLocaleString()} is paid`,
+            link: "/dashboard/seller/orders",
+          }))
+        );
+      }
+    });
+  }
+
+  return result.order;
 }
 
 const UNSUCCESSFUL_PAYMENT_STATUSES = new Set(["FAILED", "CANCELLED", "EXPIRED", "UNATTEMPTED"]);
@@ -1047,14 +1170,31 @@ app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
       } else {
         console.warn("IPN ignored: validation does not match order", { tranId });
       }
-    } else if (status && UNSUCCESSFUL_PAYMENT_STATUSES.has(status)) {
+       } else if (status && UNSUCCESSFUL_PAYMENT_STATUSES.has(status)) {
       if (verifyIpnSignature(body)) {
-        // close the unpaid order so it doesn't sit in PENDING forever;
-        // no stock was taken for it yet
-        await prisma.order.updateMany({
-          where: { transactionId: tranId, status: "PENDING", paymentStatus: { not: "PAID" } },
+        const updated = await prisma.order.updateMany({
+          where: {
+            transactionId: tranId,
+            status: "PENDING",
+            paymentStatus: { not: "PAID" },
+          },
           data: { status: "CANCELLED", paymentStatus: "FAILED" },
         });
+        if (updated.count > 0) {
+          const ord = await prisma.order.findFirst({
+            where: { transactionId: tranId },
+          });
+          if (ord) {
+            await notifyQuietly(() =>
+              createNotification({
+                userId: ord.userId,
+                title: "Payment failed",
+                body: `Payment for order #${ord.id} did not complete.`,
+                link: "/dashboard/buyer/orders",
+              })
+            );
+          }
+        }
       } else {
         console.warn("IPN ignored: invalid signature", { tranId, status });
       }
@@ -1127,6 +1267,73 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
+
+// GET /api/notifications
+app.get("/api/notifications", requireAuth, async (req, res) => {
+  try {
+    const list = await prisma.notification.findMany({
+      where: { userId: req.userId! },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+    });
+    const unreadCount = await prisma.notification.count({
+      where: { userId: req.userId!, read: false },
+    });
+    res.json({ notifications: list, unreadCount });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to load notifications" });
+  }
+});
+
+// GET /api/notifications/unread-count
+app.get("/api/notifications/unread-count", requireAuth, async (req, res) => {
+  try {
+    const unreadCount = await prisma.notification.count({
+      where: { userId: req.userId!, read: false },
+    });
+    res.json({ unreadCount });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to count notifications" });
+  }
+});
+
+// PATCH /api/notifications/:id/read
+app.patch("/api/notifications/:id/read", requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) {
+    return res.status(400).json({ error: "Invalid id" });
+  }
+  try {
+    const n = await prisma.notification.findFirst({
+      where: { id, userId: req.userId! },
+    });
+    if (!n) return res.status(404).json({ error: "Not found" });
+    const updated = await prisma.notification.update({
+      where: { id },
+      data: { read: true },
+    });
+    res.json(updated);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to update notification" });
+  }
+});
+
+// POST /api/notifications/read-all
+app.post("/api/notifications/read-all", requireAuth, async (req, res) => {
+  try {
+    await prisma.notification.updateMany({
+      where: { userId: req.userId!, read: false },
+      data: { read: true },
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to mark all read" });
+  }
+});
 
 // function modeFromCategory(category: string): TryOnMode | null {
 //   const c = category.toLowerCase();

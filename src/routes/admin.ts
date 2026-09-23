@@ -3,6 +3,8 @@ import { z } from "zod";
 import prisma from "../prisma.ts";
 import { requireAdmin } from "../middleware/requireAdmin.ts";
 import { parseId } from "../lib/params.ts";
+import { analyzeReviewRules } from "../lib/reviewGuard.ts";
+import { analyzeReview } from "../lib/reviewGuard.ts";
 import {
   canTransition,
   ORDER_STATUSES,
@@ -420,11 +422,44 @@ router.get("/reviews", async (_req, res) => {
       },
       orderBy: { createdAt: "desc" },
     });
-    res.json(reviews);
+
+    const payload = reviews.map((r) => ({
+      ...r,
+      guard: analyzeReviewRules({
+        rating: r.rating,
+        title: r.title,
+        comment: r.comment,
+        verifiedPurchase: r.verifiedPurchase,
+      }),
+    }));
+
+    res.json(payload);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to fetch reviews" });
   }
+});
+
+
+
+// GET /api/admin/reviews/:id/guard
+router.get("/reviews/:id/guard", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) {
+    return res.status(400).json({ error: "Invalid id" });
+  }
+
+  const r = await prisma.review.findUnique({ where: { id } });
+  if (!r) return res.status(404).json({ error: "Not found" });
+
+  const guard = await analyzeReview({
+    rating: r.rating,
+    title: r.title,
+    comment: r.comment,
+    verifiedPurchase: r.verifiedPurchase,
+  });
+
+  res.json(guard);
 });
 
 router.delete("/reviews/:id", async (req, res) => {
@@ -584,5 +619,7 @@ router.get("/categories", async (_req, res) => {
     res.status(500).json({ error: "Failed to fetch categories" });
   }
 });
+
+
 
 export default router;

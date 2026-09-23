@@ -5,6 +5,8 @@ import { requireSeller } from "../middleware/requireSeller.ts";
 import { parseId } from "../lib/params.ts";
 import { MAX_DISCOUNT_PERCENT } from "../lib/pricing.ts";
 import { generateListing } from "../lib/listingCopilot.ts";
+import { buildStockMind } from "../lib/stockMind.ts";
+import { getPriceSense } from "../lib/priceSense.ts";
 
 const router = Router();
 
@@ -665,6 +667,46 @@ router.post("/listing-copilot", async (req, res) => {
   } catch (error) {
     console.error("ListingCopilot error:", error);
     return res.status(500).json({ error: "Failed to generate listing" });
+  }
+});
+
+// GET /api/seller/stock-mind
+router.get("/stock-mind", async (req, res) => {
+  try {
+    // req.userId from requireAuth — same as other seller routes
+    const sellerId = req.userId!;
+    const data = await buildStockMind(sellerId);
+    return res.json(data);
+  } catch (error) {
+    console.error("StockMind error:", error);
+    return res.status(500).json({ error: "Failed to load stock insights" });
+  }
+});
+
+
+
+
+const querySchema = z.object({
+  category: z.string().trim().min(1).max(80),
+  excludeProductId: z.coerce.number().int().positive().optional(),
+});
+
+// GET /api/seller/price-sense?category=Men%27s%20Fashion
+router.get("/price-sense", async (req, res) => {
+  const parsed = querySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "category is required" });
+  }
+
+  try {
+    const data = await getPriceSense({
+      category: parsed.data.category,
+      excludeProductId: parsed.data.excludeProductId,
+    });
+    return res.json(data);
+  } catch (error) {
+    console.error("PriceSense error:", error);
+    return res.status(500).json({ error: "Failed to load price sense" });
   }
 });
 
