@@ -182,6 +182,7 @@ model user {
   wishlists      Wishlist[]
   cartItems      CartItem[]
   reviews        Review[]
+  tryOnLooks     TryOnLook[]
 
   // Products owned by this seller
   products       Product[]
@@ -257,4 +258,17 @@ model Address {
   user user @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+}
+
+model TryOnLook {
+  id          String   @id @default(cuid())
+  userId      String
+  user        user     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId   Int
+  productName String
+  imageUrl    String
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@map("try_on_look")
 }
